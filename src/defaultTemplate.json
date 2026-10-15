@@ -1,0 +1,202 @@
+{
+  "sample_data": {
+    "name": "Pedro Azevedo",
+    "role": "competitor",
+    "wcaId": "2018AZEV03",
+    "registrantId": "1",
+    "countryIso2": "PT",
+    "schedules": {},
+    "stages": []
+  },
+  "schedule_timezone": "",
+  "role_mapping": {
+    "rules": [
+      {
+        "wcaRole": "organizer",
+        "label": "organizer"
+      },
+      {
+        "wcaRole": "delegate",
+        "label": "delegate"
+      }
+    ],
+    "fallback": "competitor"
+  },
+  "fonts": {},
+  "front": {
+    "page": {
+      "width_mm": 105,
+      "height_mm": 148
+    },
+    "background": "assets/background.png",
+    "background_data": null,
+    "background_tint": {
+      "enabled": false,
+      "mapSource": "role",
+      "fallbackColor": "#1E5FD9",
+      "mappings": [
+        {
+          "value": "competitor",
+          "color": "#38dc35"
+        },
+        {
+          "value": "delegate",
+          "color": "#d53a3a"
+        },
+        {
+          "value": "organizer",
+          "color": "#463be5"
+        }
+      ]
+    },
+    "background_map": {
+      "enabled": false,
+      "mapSource": "role",
+      "fallbackPath": "assets/background.png",
+      "fallbackPreview": null,
+      "mappings": []
+    },
+    "fields": [
+      {
+        "id": "text_2",
+        "type": "text",
+        "x_mm": 11.3,
+        "y_mm": 27.5,
+        "rotate": 0,
+        "bindMode": "field",
+        "source": "role",
+        "value_map": [
+          {
+            "value": "competitor",
+            "label": "COMPETITOR"
+          },
+          {
+            "value": "delegate",
+            "label": "DELEGATE"
+          },
+          {
+            "value": "organizer",
+            "label": "ORGANIZER"
+          }
+        ],
+        "font": "Helvetica-Bold",
+        "color": "#000000",
+        "align": "center",
+        "letter_spacing": 0,
+        "wrap": true,
+        "w_mm": 83.5,
+        "break_style": "break-all",
+        "line_height": 0.95,
+        "size": 30
+      },
+      {
+        "id": "text_3",
+        "type": "text",
+        "x_mm": 7.5,
+        "y_mm": 108,
+        "rotate": 0,
+        "bindMode": "field",
+        "source": "name",
+        "font": "Helvetica-Bold",
+        "color": "#000000",
+        "align": "center",
+        "letter_spacing": 0,
+        "wrap": true,
+        "w_mm": 90,
+        "break_style": "break-word",
+        "line_height": 1.05,
+        "size": 12
+      },
+      {
+        "id": "text_4",
+        "type": "text",
+        "x_mm": 8,
+        "y_mm": 116,
+        "rotate": 0,
+        "bindMode": "template",
+        "template": "{wcaId} - ID {registrantId}",
+        "font": "Helvetica",
+        "color": "#000000",
+        "align": "center",
+        "letter_spacing": 0,
+        "wrap": true,
+        "w_mm": 90,
+        "break_style": "break-all",
+        "line_height": 1.05,
+        "size": 10
+      },
+      {
+        "id": "text_10",
+        "type": "text",
+        "x_mm": 8,
+        "y_mm": 74,
+        "rotate": 0,
+        "bindMode": "static",
+        "text": "TEST OPEN 2026",
+        "font": "Helvetica-Bold",
+        "color": "#000000",
+        "align": "left",
+        "letter_spacing": 0,
+        "wrap": false,
+        "size": 28
+      }
+    ]
+  },
+  "back": {
+    "page": {
+      "width_mm": 105,
+      "height_mm": 148
+    },
+    "background": "assets/background.png",
+    "background_data": null,
+    "background_tint": {
+      "enabled": false,
+      "mapSource": "role",
+      "fallbackColor": "#1E5FD9",
+      "mappings": [
+        {
+          "value": "competitor",
+          "color": "#38dc35"
+        },
+        {
+          "value": "delegate",
+          "color": "#d53a3a"
+        },
+        {
+          "value": "organizer",
+          "color": "#463be5"
+        }
+      ]
+    },
+    "background_map": {
+      "enabled": false,
+      "mapSource": "role",
+      "fallbackPath": "assets/background.png",
+      "fallbackPreview": null,
+      "mappings": []
+    },
+    "fields": [
+      {
+        "id": "qr_7",
+        "type": "qr",
+        "x_mm": 44.5,
+        "y_mm": 115.2,
+        "rotate": 0,
+        "target": "https://www.worldcubeassociation.org/persons/{wcaId}",
+        "size_mm": 16
+      },
+      {
+        "id": "schedule_9",
+        "type": "schedule",
+        "x_mm": 33.7,
+        "y_mm": 22.8,
+        "rotate": 0,
+        "w_mm": 37.7,
+        "h_mm": 96,
+        "dayIndex": 0,
+        "customTitle": "",
+        "excludedIds": []
+      }
+    ]
+  }
+}
