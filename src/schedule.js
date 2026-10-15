@@ -54,6 +54,34 @@ const TASK_DISPLAY = {
 
 const PLACEHOLDER_TASKS = ["C", "J", "S", "R"];
 
+const DEFAULT_COLOR = "#1E5FD9";
+
+// Stages (several timing areas inside one physical room) aren't part of the
+// core WCIF spec — they come from CubingUSA's natshelper extension: the Room
+// lists its stages, and each group activity names the stage it runs on.
+// Matched on prefix/suffix so a future "v2" of the extension still works.
+// https://github.com/cubingusa/natshelper/blob/main/specification.md
+function findNatshelperExtension(obj, kind) {
+  return (obj?.extensions || []).find(
+    (e) => typeof e.id === "string" && e.id.startsWith("org.cubingusa.natshelper.") && e.id.endsWith(`.${kind}`)
+  );
+}
+
+function roomStages(room) {
+  return findNatshelperExtension(room, "Room")?.data?.stages || [];
+}
+
+function activityStageId(activity) {
+  return findNatshelperExtension(activity, "Group")?.data?.stageId ?? null;
+}
+
+// Color an activity is shown in: its stage's color when the room is split
+// into stages, otherwise the room's own color (pre-stages WCIFs).
+function activityColor(activity, room, stagesById) {
+  const stage = stagesById[activityStageId(activity)];
+  return stage?.color || room.color || DEFAULT_COLOR;
+}
+
 /**
  * Resolves which IANA/Olson timezone to display schedule times in.
  * An explicit override always wins; otherwise this falls back to the
@@ -127,23 +155,49 @@ function buildBaseSchedule(wcif, timeZone = "UTC") {
       } else {
         return `${shortened(parts[0], code)} ${parts[1][0]}${parts[1].split(" ")[1]} - ${parts[2][0]}${parts[2].split(" ")[1]}`;
       }
+    } else if (/^[^-]+-r\d+/.test(code || "") && name.includes(" Round ")) {
+      return shortenedFromCode(name, code);
     } else {
       return ABV[name] || name;
     }
   }
 
-  // 1. Map rooms & index all activities (every room's activities, including
-  // parallel stages hosting the same round).
-  const roomsById = {};
+  // Newer names drop the commas and, in stage-split rooms, use the stage
+  // name instead of "Group" ("3x3x3 Cube Round 1 Green 3"). The name is only
+  // trusted for the event part; round/group/attempt come from the
+  // activityCode, and the stage itself is conveyed by the row's color.
+  function shortenedFromCode(name, code) {
+    const eventName = name.split(" Round ")[0];
+    const eventId = code.split("-")[0];
+    const roundNum = parseInt(code.match(/-r(\d+)/)[1], 10);
+    const groupNum = code.match(/-g(\d+)/)?.[1];
+    const attemptNum = code.match(/-a(\d+)/)?.[1];
+    const abbreviated = ABV[eventName] || eventName;
+    const subsequent = SUBSEQUENT_ROUND_NAMES[eventName] || eventName;
+
+    if (attemptNum) {
+      return `${abbreviated} - A${attemptNum}`;
+    } else if (roundNum === (roundAmounts[eventId] || 0)) {
+      return `${subsequent} Final`;
+    } else if (roundNum > 1 && (groupAmounts[code] || 1) > 1) {
+      return `${subsequent} R${roundNum}`;
+    } else if (groupNum) {
+      return `${abbreviated} R${roundNum} - G${groupNum}`;
+    } else {
+      return `${abbreviated} R${roundNum}`;
+    }
+  }
+
+  // 1. Index all activities (every room's activities, including parallel
+  // stages hosting the same round), each tagged with the color of the
+  // stage — or, without stages, the room — it happens in.
   const activities = [];
   const seenActivityIds = new Set();
 
   for (const venue of wcif.schedule?.venues || []) {
     for (const room of venue.rooms || []) {
-      roomsById[room.id] = {
-        name: room.name || "",
-        color: room.color || "#1E5FD9",
-      };
+      const stagesById = {};
+      for (const stage of roomStages(room)) stagesById[stage.id] = stage;
 
       for (const act of room.activities || []) {
         if (!act.childActivities || act.childActivities.length === 0) {
@@ -155,7 +209,7 @@ function buildBaseSchedule(wcif, timeZone = "UTC") {
               name: act.name,
               startTime: act.startTime,
               activityCode: act.activityCode,
-              roomId: room.id,
+              color: activityColor(act, room, stagesById),
             });
           }
         }
@@ -169,7 +223,7 @@ function buildBaseSchedule(wcif, timeZone = "UTC") {
               name: child.name,
               startTime: child.startTime,
               activityCode: child.activityCode,
-              roomId: room.id,
+              color: activityColor(child, room, stagesById),
             });
           }
         }
@@ -226,7 +280,7 @@ function buildBaseSchedule(wcif, timeZone = "UTC") {
         event: shortened(activity.name, activity.activityCode),
         activity_ids: [activity.id],
         parent_ids: [activity.parentId],
-        room_ids: [activity.roomId],
+        colors: [activity.color],
         activityCode: activity.activityCode,
         isSubsequentRound,
         sort_key: sortKey,
@@ -235,7 +289,7 @@ function buildBaseSchedule(wcif, timeZone = "UTC") {
       const row = bucket.get(key);
       row.activity_ids.push(activity.id);
       row.parent_ids.push(activity.parentId);
-      row.room_ids.push(activity.roomId);
+      row.colors.push(activity.color);
     }
   }
 
@@ -244,7 +298,7 @@ function buildBaseSchedule(wcif, timeZone = "UTC") {
     baseSchedule[day] = Array.from(bucket.values()).sort((a, b) => a.sort_key - b.sort_key);
   }
 
-  return { baseSchedule, roomsById };
+  return { baseSchedule };
 }
 
 /**
@@ -256,7 +310,7 @@ function buildBaseSchedule(wcif, timeZone = "UTC") {
  */
 export function buildCompetitorSchedules(wcif, timezoneOverride) {
   const timeZone = resolveScheduleTimezone(wcif, timezoneOverride);
-  const { baseSchedule, roomsById } = buildBaseSchedule(wcif, timeZone);
+  const { baseSchedule } = buildBaseSchedule(wcif, timeZone);
 
   const competitorSchedules = {};
 
@@ -282,7 +336,7 @@ export function buildCompetitorSchedules(wcif, timezoneOverride) {
             if (assigned) {
               const rawCode = assigned.assignmentCode || "";
               task = TASK_DISPLAY[rawCode] || rawCode.replace(/^staff-/, "").charAt(0).toUpperCase();
-              color = roomsById[round.room_ids[i]]?.color || "#1E5FD9";
+              color = round.colors[i];
               break;
             }
           }
@@ -359,19 +413,29 @@ export function buildGenericSchedule(wcif, timezoneOverride) {
 }
 
 /**
- * Flat list of every stage/room in the competition, deduplicated, in the
- * order they first appear. Used to build the "stage color key" — a legend
- * mapping each stage's name to the color it's shown in throughout the
- * schedule field.
+ * Flat list of every stage in the competition, deduplicated, in the order
+ * they first appear. Used to build the "stage color key" — a legend mapping
+ * each stage's name to the color it's shown in throughout the schedule
+ * field. A room split into natshelper stages contributes its stages; a room
+ * without them counts as a single stage itself (as in pre-stages WCIFs).
  */
 export function buildStageList(wcif) {
   const stages = [];
   const seen = new Set();
   for (const venue of wcif.schedule?.venues || []) {
     for (const room of venue.rooms || []) {
-      if (seen.has(room.id)) continue;
-      seen.add(room.id);
-      stages.push({ name: room.name || `Stage ${stages.length + 1}`, color: room.color || "#1E5FD9" });
+      const subStages = roomStages(room);
+      if (subStages.length > 0) {
+        for (const stage of subStages) {
+          if (seen.has(`stage-${stage.id}`)) continue;
+          seen.add(`stage-${stage.id}`);
+          stages.push({ name: stage.name || `Stage ${stages.length + 1}`, color: stage.color || room.color || DEFAULT_COLOR });
+        }
+      } else {
+        if (seen.has(`room-${room.id}`)) continue;
+        seen.add(`room-${room.id}`);
+        stages.push({ name: room.name || `Stage ${stages.length + 1}`, color: room.color || DEFAULT_COLOR });
+      }
     }
   }
   return stages;
