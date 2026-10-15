@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { buildCompetitorSchedules, buildGenericSchedule, buildStageList, resolveScheduleTimezone } from "./schedule.js";
 import { generateBadgesPdf, downloadPdfBytes } from "./pdfExport.js";
+import defaultTemplate from "./defaultTemplate.json";
 
 const SCALE = 5.2; // px per mm
 const MIN_MM = 4;
@@ -452,17 +453,6 @@ function defaultBackgroundMap() {
   };
 }
 
-function defaultSide(w, h, seedFields) {
-  return {
-    page: { width_mm: w, height_mm: h },
-    background: null,
-    backgroundName: "assets/background.png",
-    tint: defaultTint(),
-    backgroundMap: defaultBackgroundMap(),
-    fields: seedFields || [],
-  };
-}
-
 function textFieldDefaults() {
   return {
     bindMode: "field",
@@ -485,136 +475,7 @@ function textFieldDefaults() {
 }
 
 function initialState() {
-  return {
-    sampleData: {
-      name: "Pedro Azevedo",
-      role: "competitor",
-      wcaId: "2018AZEV03",
-      registrantId: "1",
-      countryIso2: "PT",
-      // No seeded schedule on purpose: until a WCIF is loaded (via "Load WCIF
-      // JSON"), the schedule field renders its own generic placeholder rows
-      // (see the schedule branch in FieldBox). Loading a WCIF fills this with
-      // buildGenericSchedule()'s output — real dates/events/room colors, but
-      // still placeholder tasks, never a specific person's real assignments.
-      schedules: {},
-      // Same story: empty until a WCIF is loaded, at which point it's the
-      // competition's real stage names + colors (see buildStageList).
-      // Until then the Task Key field falls back to generic placeholder
-      // stages (see TASKKEY_FALLBACK_STAGES).
-      stages: [],
-    },
-
-    // Empty = auto: use the competition venue's own timezone from the WCIF
-    // (Venue.timezone, an Olson/IANA name — see resolveScheduleTimezone in
-    // schedule.js). Set explicitly to override it, e.g. if the WCIF's
-    // venue.timezone is missing/wrong, or to preview in a different zone.
-    scheduleTimezone: "",
-
-    // Maps a WCIF person's `roles` array (they can hold more than one at
-    // once, e.g. an organizer who's also a judge) down to the single
-    // "role" value used throughout the template (text mappings, tint,
-    // background images, etc. — see the "ROLE FIELDS" panel). Rules are
-    // checked in order; the first one whose wcaRole appears in the
-    // person's roles wins, so priority between roles is an explicit
-    // choice rather than code. Anyone matching no rule gets `fallback`.
-    // Mirrors DEFAULT_ROLE_MAPPING in pdfExport.js exactly, so a template
-    // saved before this feature existed keeps behaving the same way.
-    roleMapping: {
-      rules: [
-        { wcaRole: "organizer", label: "organizer" },
-        { wcaRole: "delegate", label: "delegate" },
-      ],
-      fallback: "competitor",
-    },
-
-    fonts: [],
-    front: defaultSide(105, 148, [
-      {
-        id: uid("colorblock"),
-        type: "colorblock",
-        x_mm: 0,
-        y_mm: 0,
-        w_mm: 105,
-        h_mm: 148,
-        rotate: 0,
-        mapSource: "role",
-        fallbackColor: "#9CA3AF",
-        opacity: 100,
-        mappings: [
-          { value: "competitor", color: "#5A8F2E" },
-          { value: "delegate", color: "#ec1b1b" },
-          { value: "organizer", color: "#4552e2" },
-        ],
-        labelSource: null,
-        labelColor: "#FFFFFF",
-      },
-      {
-        id: uid("text"),
-        type: "text",
-        x_mm: 8,
-        y_mm: 10,
-        rotate: 0,
-        ...textFieldDefaults(),
-        bindMode: "field",
-        source: "role",
-        useValueMap: true,
-        valueMap: [
-          { value: "competitor", label: "COMPETITOR" },
-          { value: "delegate", label: "DELEGATE" },
-          { value: "organizer", label: "ORGANIZER" },
-        ],
-        font: "Helvetica-Bold",
-        size: 30,
-        color: "#FFFFFF",
-        align: "left",
-        wrap: true,
-        w_mm: 60,
-        breakStyle: "break-all",
-        lineHeight: 0.95,
-      },
-      {
-        id: uid("text"),
-        type: "text",
-        x_mm: 8,
-        y_mm: 108,
-        rotate: 0,
-        ...textFieldDefaults(),
-        bindMode: "field",
-        source: "name",
-        font: "Helvetica-Bold",
-        size: 12,
-        color: "#FFFFFF",
-        align: "center",
-        wrap: true,
-        w_mm: 90,
-        breakStyle: "break-word",
-      },
-      {
-        id: uid("text"),
-        type: "text",
-        x_mm: 8,
-        y_mm: 116,
-        rotate: 0,
-        ...textFieldDefaults(),
-        bindMode: "template",
-        template: "{wcaId} - ID {registrantId}",
-        font: "Helvetica",
-        size: 10,
-        color: "#FFFFFF",
-        align: "center",
-        wrap: true,
-        w_mm: 90,
-      },
-      { id: uid("text"), type: "text", x_mm: 52, y_mm: 140, rotate: 0, ...textFieldDefaults(), bindMode: "static", staticText: "WCA EURO 2026 · ARNHEM NL", font: "Helvetica", size: 7, color: "#FFFFFF", align: "center" },
-    ]),
-    back: defaultSide(148, 105, [
-      { id: uid("text"), type: "text", x_mm: 6, y_mm: 6, rotate: 90, ...textFieldDefaults(), bindMode: "field", source: "registrantId", customPrefix: "#", font: "Helvetica-Bold", size: 11, color: "#141414" },
-      { id: uid("qr"), type: "qr", target: "https://www.worldcubeassociation.org/persons/{wcaId}", x_mm: 6, y_mm: 95, size_mm: 16 },
-      { id: uid("qr"), type: "qr", target: "https://live.worldcubeassociation.org/", x_mm: 126, y_mm: 99, size_mm: 16 },
-      { id: uid("schedule"), type: "schedule", x_mm: 26, y_mm: 6, w_mm: 96, h_mm: 96, dayIndex: 0 },
-    ]),
-  };
+  return inflateTemplate(defaultTemplate);
 }
 
 // ---------- import: rebuild internal field shapes from an exported template.json ----------
