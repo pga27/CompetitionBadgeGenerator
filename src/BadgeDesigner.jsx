@@ -23,6 +23,7 @@ import {
   ChevronUp,
   ChevronDown,
   Users,
+  SwatchBook,
 } from "lucide-react";
 import { buildCompetitorSchedules, buildGenericSchedule, buildStageList, resolveScheduleTimezone } from "./schedule.js";
 import { generateBadgesPdf, downloadPdfBytes } from "./pdfExport.js";
@@ -34,6 +35,7 @@ const TINT_ID = "__tint__";
 const FONTS_ID = "__fonts__";
 const BGMAP_ID = "__bgmap__";
 const ROLEMAP_ID = "__rolemap__";
+const STAGECOLORS_ID = "__stagecolors__";
 // Country flags, bundled into the project rather than fetched at runtime
 // — put one file per country under src/assets/flags/, named by its WCA
 // countryIso2 code (e.g. assets/flags/PT.svg, assets/flags/US.svg).
@@ -629,6 +631,9 @@ function inflateTemplate(data) {
       ],
       fallback: "competitor",
     },
+    // Stage name -> color to print instead of the one set on the WCA
+    // website (see StageColorsPanel). Empty = WCA colors everywhere.
+    stageColors: data.stage_colors || {},
     fonts: inflatedFonts,
     front: inflateSide(data.front, 105, 148),
     back: inflateSide(data.back, 148, 105),
@@ -675,7 +680,7 @@ export default function BadgeDesigner() {
       // data (and buildCompetitorSchedules) only gets used later, in batch
       // generation, once this template is applied to the whole roster.
       const genericSchedule = buildGenericSchedule(wcif, state.scheduleTimezone || undefined);
-      const stages = buildStageList(wcif);
+      const stages = buildStageList(wcif, state.stageColors);
 
       // Populates any "driven by country" image field's mappings from the
       // flags actually needed for this WCIF's competitors (see
@@ -719,7 +724,7 @@ export default function BadgeDesigner() {
   const dragRef = useRef(null);
   const sideData = state[side];
   const fields = sideData.fields;
-  const selectedField = selectedId && selectedId !== TINT_ID && selectedId !== FONTS_ID && selectedId !== BGMAP_ID && selectedId !== ROLEMAP_ID ? fields.find((f) => f.id === selectedId) : null;
+  const selectedField = selectedId && selectedId !== TINT_ID && selectedId !== FONTS_ID && selectedId !== BGMAP_ID && selectedId !== ROLEMAP_ID && selectedId !== STAGECOLORS_ID ? fields.find((f) => f.id === selectedId) : null;
 
   const updateSide = (patch) => setState((s) => ({ ...s, [side]: { ...s[side], ...patch } }));
   const updateField = (id, patch) => updateSide({ fields: sideData.fields.map((f) => (f.id === id ? { ...f, ...patch } : f)) });
@@ -741,6 +746,22 @@ export default function BadgeDesigner() {
   // Global, not per-side (like scheduleTimezone) — a person's role doesn't
   // change between the front and back of their own badge.
   const updateRoleMapping = (patch) => setState((s) => ({ ...s, roleMapping: { ...s.roleMapping, ...patch } }));
+  // Global too: a stage is the same color on every badge and on both sides.
+  // color === null drops the override, going back to the WCA color.
+  // sampleData.stages is re-derived so the Task Key preview follows along.
+  const setStageColor = (name, color) =>
+    setState((prev) => {
+      const stageColors = { ...prev.stageColors };
+      if (color) stageColors[name] = color;
+      else delete stageColors[name];
+      const stages = prev.wcif
+        ? buildStageList(prev.wcif, stageColors)
+        : (prev.sampleData.stages || []).map((s) => {
+            const wcaColor = s.wcaColor || s.color;
+            return { ...s, wcaColor, color: stageColors[s.name] || wcaColor };
+          });
+      return { ...prev, stageColors, sampleData: { ...prev.sampleData, stages } };
+    });
 
   const addField = (type) => {
     const count = fields.filter((f) => f.type === type).length;
@@ -1057,6 +1078,7 @@ export default function BadgeDesigner() {
       sample_data: state.sampleData,
       schedule_timezone: state.scheduleTimezone || "",
       role_mapping: state.roleMapping,
+      stage_colors: state.stageColors,
       fonts: fontsManifest,
       front: {
         page: state.front.page,
@@ -1211,6 +1233,10 @@ export default function BadgeDesigner() {
 
         <button onClick={() => setSelectedId(ROLEMAP_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === ROLEMAP_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
           <Users size={12} /> Role mapping
+        </button>
+
+        <button onClick={() => setSelectedId(STAGECOLORS_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === STAGECOLORS_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
+          <SwatchBook size={12} /> Stage colors
         </button>
 
         <div className="flex-1" />
@@ -1405,6 +1431,7 @@ export default function BadgeDesigner() {
               />
             )}
             {selectedId === ROLEMAP_ID && <RoleMappingPanel roleMapping={state.roleMapping} onChange={updateRoleMapping} />}
+            {selectedId === STAGECOLORS_ID && <StageColorsPanel stages={state.sampleData.stages || []} stageColors={state.stageColors} onChange={setStageColor} />}
             {selectedField && (
               <PropertiesPanel
                 field={selectedField}
@@ -2014,6 +2041,42 @@ function RoleMappingPanel({ roleMapping, onChange }) {
   );
 }
 
+// <input type="color"> only accepts #rrggbb, but WCIF allows #rgb too.
+const toSixDigitHex = (hex) => (/^#[0-9a-f]{3}$/i.test(hex || "") ? `#${[...hex.slice(1)].map((c) => c + c).join("")}` : hex);
+
+function StageColorsPanel({ stages, stageColors, onChange }) {
+  return (
+    <div className="p-4 space-y-3 border-t border-neutral-200 overflow-y-auto">
+      <div className="text-xs font-semibold text-neutral-500 flex items-center gap-1.5">
+        <SwatchBook size={12} /> STAGE COLORS
+      </div>
+      <div className="text-[11px] text-neutral-400">
+        Colors come from the WCA website by default. Pick a different one for any stage (e.g. a pastel tone that prints better) — it's used in the schedule rows and the task key of every badge, and saved with the template.
+      </div>
+
+      <div className="space-y-1.5">
+        {stages.map((s) => {
+          const wcaColor = s.wcaColor || s.color;
+          const overridden = !!stageColors[s.name];
+          return (
+            <div key={s.name} className="flex items-center gap-2">
+              <input type="color" value={toSixDigitHex(s.color)} onChange={(e) => onChange(s.name, e.target.value)} className="w-8 h-7 border border-neutral-300 rounded cursor-pointer shrink-0" />
+              <span className="flex-1 text-sm truncate">{s.name}</span>
+              {overridden && (
+                <button onClick={() => onChange(s.name, null)} className="flex items-center gap-1 text-[11px] text-neutral-500 hover:text-neutral-800 shrink-0" title={`Back to the WCA color (${wcaColor})`}>
+                  <span className="w-3 h-3 rounded-sm border border-neutral-300" style={{ background: wcaColor }} />
+                  Reset
+                </button>
+              )}
+            </div>
+          );
+        })}
+        {stages.length === 0 && <div className="text-xs text-neutral-400">Load a WCIF first — its stages (or rooms) are listed here.</div>}
+      </div>
+    </div>
+  );
+}
+
 function FontsPanel({ fonts, onUpload, onRename, onRemove, onAddGooglePreset, addingGoogleFont }) {
   const onFile = (e) => {
     const file = e.target.files?.[0];
@@ -2475,7 +2538,7 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
           <div className="space-y-2">
             <div className="text-[11px] font-semibold text-neutral-600">Stage names</div>
             <div className="text-[10px] text-neutral-400 mb-1">
-              Names come from the loaded competition by default — edit any of them below to override just the label (color still follows the real stage).
+              Names come from the loaded competition by default — edit any of them below to override just the label (color still follows the real stage; change it under "Stage colors" in the toolbar).
             </div>
             {stageRows.map((s, i) => (
               <div key={i} className="flex items-center gap-1.5">

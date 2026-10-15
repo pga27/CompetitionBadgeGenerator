@@ -76,10 +76,13 @@ function activityStageId(activity) {
 }
 
 // Color an activity is shown in: its stage's color when the room is split
-// into stages, otherwise the room's own color (pre-stages WCIFs).
-function activityColor(activity, room, stagesById) {
+// into stages, otherwise the room's own color (pre-stages WCIFs). A user
+// override for that stage name (stageColors, e.g. a softer print-friendly
+// tone than the one set on the WCA website) wins over both.
+function activityColor(activity, room, stagesById, stageColors) {
   const stage = stagesById[activityStageId(activity)];
-  return stage?.color || room.color || DEFAULT_COLOR;
+  const name = stage ? stage.name : room.name;
+  return stageColors[name] || stage?.color || room.color || DEFAULT_COLOR;
 }
 
 /**
@@ -120,7 +123,7 @@ function formatInTimezone(isoUtcString, timeZone) {
   return { day: `${get("year")}-${get("month")}-${get("day")}`, time: `${get("hour")}:${get("minute")}` };
 }
 
-function buildBaseSchedule(wcif, timeZone = "UTC") {
+function buildBaseSchedule(wcif, timeZone = "UTC", stageColors = {}) {
   const roundAmounts = {};
   for (const event of wcif.events || []) {
     roundAmounts[event.id] = (event.rounds || []).length;
@@ -209,7 +212,7 @@ function buildBaseSchedule(wcif, timeZone = "UTC") {
               name: act.name,
               startTime: act.startTime,
               activityCode: act.activityCode,
-              color: activityColor(act, room, stagesById),
+              color: activityColor(act, room, stagesById, stageColors),
             });
           }
         }
@@ -223,7 +226,7 @@ function buildBaseSchedule(wcif, timeZone = "UTC") {
               name: child.name,
               startTime: child.startTime,
               activityCode: child.activityCode,
-              color: activityColor(child, room, stagesById),
+              color: activityColor(child, room, stagesById, stageColors),
             });
           }
         }
@@ -308,9 +311,9 @@ function buildBaseSchedule(wcif, timeZone = "UTC") {
  * specific stage — color is how you tell stages apart, per row. This is
  * what batch generation uses to fill each individual badge.
  */
-export function buildCompetitorSchedules(wcif, timezoneOverride) {
+export function buildCompetitorSchedules(wcif, timezoneOverride, stageColors = {}) {
   const timeZone = resolveScheduleTimezone(wcif, timezoneOverride);
-  const { baseSchedule } = buildBaseSchedule(wcif, timeZone);
+  const { baseSchedule } = buildBaseSchedule(wcif, timeZone, stageColors);
 
   const competitorSchedules = {};
 
@@ -418,23 +421,24 @@ export function buildGenericSchedule(wcif, timezoneOverride) {
  * each stage's name to the color it's shown in throughout the schedule
  * field. A room split into natshelper stages contributes its stages; a room
  * without them counts as a single stage itself (as in pre-stages WCIFs).
+ * `color` is what gets printed (the user's override from stageColors, if
+ * any); `wcaColor` is the one set on the WCA website, kept for resetting.
  */
-export function buildStageList(wcif) {
+export function buildStageList(wcif, stageColors = {}) {
   const stages = [];
   const seen = new Set();
+  const push = (key, rawName, wcaColor) => {
+    if (seen.has(key)) return;
+    seen.add(key);
+    stages.push({ name: rawName || `Stage ${stages.length + 1}`, color: stageColors[rawName] || wcaColor, wcaColor });
+  };
   for (const venue of wcif.schedule?.venues || []) {
     for (const room of venue.rooms || []) {
       const subStages = roomStages(room);
       if (subStages.length > 0) {
-        for (const stage of subStages) {
-          if (seen.has(`stage-${stage.id}`)) continue;
-          seen.add(`stage-${stage.id}`);
-          stages.push({ name: stage.name || `Stage ${stages.length + 1}`, color: stage.color || room.color || DEFAULT_COLOR });
-        }
+        for (const stage of subStages) push(`stage-${stage.id}`, stage.name, stage.color || room.color || DEFAULT_COLOR);
       } else {
-        if (seen.has(`room-${room.id}`)) continue;
-        seen.add(`room-${room.id}`);
-        stages.push({ name: room.name || `Stage ${stages.length + 1}`, color: room.color || DEFAULT_COLOR });
+        push(`room-${room.id}`, room.name, room.color || DEFAULT_COLOR);
       }
     }
   }

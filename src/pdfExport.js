@@ -1117,8 +1117,8 @@ export async function generateBadgesPdf(state, wcif, onProgress) {
     }
   }
 
-  const competitorSchedules = buildCompetitorSchedules(wcif, state.scheduleTimezone || undefined);
-  const stages = buildStageList(wcif);
+  const competitorSchedules = buildCompetitorSchedules(wcif, state.scheduleTimezone || undefined, state.stageColors || {});
+  const stages = buildStageList(wcif, state.stageColors || {});
 
   const persons = (wcif.persons || []).filter(
     (p) => (p.registration && p.registration.status === "accepted") || (!p.registration && p.roles && p.roles.length)
