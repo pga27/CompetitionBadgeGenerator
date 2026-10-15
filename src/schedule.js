@@ -54,7 +54,45 @@ const TASK_DISPLAY = {
 
 const PLACEHOLDER_TASKS = ["C", "J", "S", "R"];
 
-function buildBaseSchedule(wcif) {
+/**
+ * Resolves which IANA/Olson timezone to display schedule times in.
+ * An explicit override always wins; otherwise this falls back to the
+ * first venue's `timezone` in the WCIF. That field is part of the WCIF
+ * spec precisely for this purpose (an Olson/IANA zone name, e.g.
+ * "Europe/Lisbon") and — unlike a fixed UTC-hour offset someone has to
+ * remember to update — correctly reflects whether DST is in effect for
+ * the competition's actual dates, automatically, every year. Falls back
+ * to "UTC" (the previous behavior) if neither is available.
+ */
+export function resolveScheduleTimezone(wcif, override) {
+  if (override) return override;
+  for (const venue of wcif?.schedule?.venues || []) {
+    if (venue.timezone) return venue.timezone;
+  }
+  return "UTC";
+}
+
+// Splits an ISO 8601 UTC instant into the wall-clock date + time it falls
+// on in `timeZone`, via Intl's own IANA timezone database — this is what
+// actually gets DST right (Intl knows the real transition dates for the
+// zone, rather than this code having to hardcode "+1 in summer" and hope
+// nobody forgets to update it).
+function formatInTimezone(isoUtcString, timeZone) {
+  const date = new Date(isoUtcString);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).formatToParts(date);
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+  return { day: `${get("year")}-${get("month")}-${get("day")}`, time: `${get("hour")}:${get("minute")}` };
+}
+
+function buildBaseSchedule(wcif, timeZone = "UTC") {
   const roundAmounts = {};
   for (const event of wcif.events || []) {
     roundAmounts[event.id] = (event.rounds || []).length;
@@ -78,7 +116,7 @@ function buildBaseSchedule(wcif) {
     if (name.includes(",")) {
       const parts = name.split(", ");
       if (parts[0] === "3x3x3 Multi-Blind") {
-        return `${ABV[parts[0]] || parts[0]} - ${parts[3][0]}${parts[3].split(" ")[1]}`;
+        return `${ABV[parts[0]] || parts[0]} - ${parts[2][0]}${parts[2].split(" ")[1]}`;
       }
 
       const roundNum = parseInt(parts[1].split(" ")[1], 10);
@@ -150,10 +188,23 @@ function buildBaseSchedule(wcif) {
   for (const activity of activities) {
     if (!activity.startTime) continue;
 
-    // Handles '2026-07-18T09:30:00Z' cleanly without UTC shift
-    const [datePart, timePart] = activity.startTime.split("T");
-    const startTime = timePart.slice(0, 5); // '09:30'
-    const day = datePart; // '2026-07-18'
+    // Convert the activity's absolute UTC instant to the wall-clock
+    // date+time it falls on in `timeZone` (see formatInTimezone above —
+    // this is what makes the displayed times follow DST correctly). An
+    // invalid/unrecognized zone name (Intl throws a RangeError for those)
+    // falls back to the raw UTC digits rather than silently dropping the
+    // row, so a typo in a manual override degrades gracefully instead of
+    // breaking the whole schedule.
+    let day, startTime;
+    try {
+      const formatted = formatInTimezone(activity.startTime, timeZone);
+      day = formatted.day;
+      startTime = formatted.time;
+    } catch (e) {
+      const [datePart, timePart] = activity.startTime.split("T");
+      day = datePart;
+      startTime = timePart.slice(0, 5);
+    }
     const sortKey = new Date(activity.startTime).getTime();
     const key = `${activity.activityCode || `noCode_${activity.id}`}_${activity.startTime}`;
 
@@ -203,13 +254,14 @@ function buildBaseSchedule(wcif) {
  * specific stage — color is how you tell stages apart, per row. This is
  * what batch generation uses to fill each individual badge.
  */
-export function buildCompetitorSchedules(wcif) {
-  const { baseSchedule, roomsById } = buildBaseSchedule(wcif);
+export function buildCompetitorSchedules(wcif, timezoneOverride) {
+  const timeZone = resolveScheduleTimezone(wcif, timezoneOverride);
+  const { baseSchedule, roomsById } = buildBaseSchedule(wcif, timeZone);
 
   const competitorSchedules = {};
 
   for (const person of wcif.persons || []) {
-    const regId = String(person.registrantId);
+    const regId = String(person.registrantId) || String(person.wcaId);
 
     const assignmentsById = {};
     for (const a of person.assignments || []) {
@@ -267,8 +319,9 @@ export function buildCompetitorSchedules(wcif) {
  * once a specific person is known, which only happens during batch
  * generation (see buildCompetitorSchedules above).
  */
-export function buildGenericSchedule(wcif) {
-  const { baseSchedule } = buildBaseSchedule(wcif);
+export function buildGenericSchedule(wcif, timezoneOverride) {
+  const timeZone = resolveScheduleTimezone(wcif, timezoneOverride);
+  const { baseSchedule } = buildBaseSchedule(wcif, timeZone);
 
   const genericSchedule = {};
   let counter = 0;

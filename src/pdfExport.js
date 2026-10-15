@@ -103,7 +103,18 @@ function normText(s) {
 }
 
 function resolveTemplateStr(str, ctx) {
-  return normText((str || "").replace(/\{(\w+)\}/g, (_, k) => (ctx[k] !== undefined && ctx[k] !== null ? ctx[k] : `{${k}}`)));
+  return normText((str || "").replace(/\{(\w+)(?:\|([^}]*))?\}/g, (_, k, fallback) => {
+    const has = Object.prototype.hasOwnProperty.call(ctx, k);
+    const v = ctx[k];
+    const isEmpty = v === undefined || v === null || v === "";
+    // Mirrors resolveTemplate() in BadgeDesigner.jsx — see its comment for
+    // the reasoning. Unknown key with no fallback keeps the literal
+    // placeholder (surfaces typos); otherwise empty/missing values use the
+    // fallback text if one was given, an empty string if not.
+    if (!has && fallback === undefined) return `{${k}}`;
+    if (isEmpty) return fallback !== undefined ? fallback : "";
+    return v;
+  }));
 }
 
 function resolveTextValue(field, ctx) {
@@ -402,11 +413,11 @@ async function drawImageField(page, field, ctx, pdfDoc, imageCache, originX, ori
   }
   if (!src) return;
 
-  const embedded = await embedImageCached(pdfDoc, src, imageCache);
-  if (!embedded) return;
-
   const boxW = mmv(field.w_mm);
   const boxH = mmv(field.h_mm);
+
+  const embedded = await embedImageCached(pdfDoc, src, imageCache, { width: boxW, height: boxH });
+  if (!embedded) return;
 
   // Match the designer canvas's `object-contain` rendering (see FieldBox's
   // "w-full h-full object-contain" for image fields): scale the image to
@@ -432,13 +443,54 @@ async function drawImageField(page, field, ctx, pdfDoc, imageCache, originX, ori
   page.drawImage(embedded, { x, y, width: w, height: h });
 }
 
-async function embedImageCached(pdfDoc, dataUrl, cache) {
-  if (cache.has(dataUrl)) return cache.get(dataUrl);
+// PDF points -> raster pixels at a print-quality DPI. A vector source
+// (SVG) has no intrinsic pixel resolution of its own, so this decides how
+// many pixels to rasterize it at based on how large it'll actually be
+// drawn on the page — enough to stay crisp when printed, without
+// ballooning file size by always rendering at some arbitrary large fixed
+// size regardless of how small the field actually is.
+const SVG_RASTER_DPI = 300;
+function ptToRasterPx(pt) {
+  return Math.max(1, Math.round(pt * (SVG_RASTER_DPI / 72)));
+}
+
+// Rasterizes an SVG data URL to a PNG data URL via canvas — the same
+// technique tintImageDataUrl above already relies on (loading an SVG into
+// an <img> and drawing it to canvas rasterizes it as a side effect;
+// that's what makes tinted plain backgrounds already work with SVG
+// sources today). targetWidthPx/targetHeightPx are optional; without
+// them this falls back to the SVG's own intrinsic size.
+async function rasterizeSvgDataUrl(svgDataUrl, targetWidthPx, targetHeightPx) {
+  const img = await loadImageEl(svgDataUrl);
+  const canvas = document.createElement("canvas");
+  canvas.width = targetWidthPx || img.naturalWidth || 512;
+  canvas.height = targetHeightPx || img.naturalHeight || 512;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/png");
+}
+
+async function embedImageCached(pdfDoc, dataUrl, cache, targetSizePt) {
+  const isSvg = dataUrl.startsWith("data:image/svg+xml");
+  // pdf-lib only embeds PNG/JPG — it has no SVG support at all, so an SVG
+  // source has to be rasterized first (see rasterizeSvgDataUrl above).
+  // The cache key folds in the raster target size for SVGs specifically:
+  // the same vector source used both as a small field image and a
+  // full-page background needs two differently-sized rasters, not one
+  // shared cache entry sized for whichever call happened to run first.
+  const cacheKey = isSvg && targetSizePt ? `${dataUrl}::${Math.round(targetSizePt.width)}x${Math.round(targetSizePt.height)}` : dataUrl;
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
   try {
-    const bytes = dataUrlToBytes(dataUrl);
-    const isPng = dataUrl.startsWith("data:image/png");
+    let rasterDataUrl = dataUrl;
+    if (isSvg) {
+      const targetW = targetSizePt ? ptToRasterPx(targetSizePt.width) : undefined;
+      const targetH = targetSizePt ? ptToRasterPx(targetSizePt.height) : undefined;
+      rasterDataUrl = await rasterizeSvgDataUrl(dataUrl, targetW, targetH);
+    }
+    const bytes = dataUrlToBytes(rasterDataUrl);
+    const isPng = rasterDataUrl.startsWith("data:image/png");
     const embedded = isPng ? await pdfDoc.embedPng(bytes) : await pdfDoc.embedJpg(bytes);
-    cache.set(dataUrl, embedded);
+    cache.set(cacheKey, embedded);
     return embedded;
   } catch (e) {
     console.error("Failed to embed image", e);
@@ -567,8 +619,11 @@ function drawScheduleField(page, field, ctx, fonts, originX, originY) {
   for (const { block, topY: rowTop } of layout) {
     if (block.type === "qr-group") {
       const groupRows = block.rows;
-      const groupColor = groupRows.find((r) => r.color)?.color;
-      page.drawRectangle({ x: x0 + w - taskW, y: rowTop - mmv(groupRows.length * SCHEDULE_ROW_H_MM), width: taskW, height: mmv(groupRows.length * SCHEDULE_ROW_H_MM), color: hexToRgb01(groupColor || "#ffffff") });
+      // The merged "QR" cell is always white background — it holds only
+      // the "QR" label (a QR code is meant to be scanned there physically,
+      // or printed on top later), never the stage-color tint other task
+      // cells get from a row's own color.
+      page.drawRectangle({ x: x0 + w - taskW, y: rowTop - mmv(groupRows.length * SCHEDULE_ROW_H_MM), width: taskW, height: mmv(groupRows.length * SCHEDULE_ROW_H_MM), color: hexToRgb01("#ffffff") });
       centered("QR", x0 + w - taskW / 2, rowTop - mmv(groupRows.length * SCHEDULE_ROW_H_MM) / 2, fonts.helveticaBold, SCHEDULE_QR_FONT_SIZE);
 
       let subY2 = rowTop;
@@ -715,8 +770,14 @@ function drawTaskKeyField(page, field, ctx, fonts, originX, originY) {
 // fetching) the whole family.
 //
 // Family -> heuristic detector is handled in scriptFamilyForName() below;
-// this set just controls which family names are legal targets.
-const GOOGLE_FONT_FAMILIES = ["Noto Sans KR", "Noto Sans JP", "Noto Sans SC", "Noto Sans TC"];
+// this set just controls which family names are legal targets. "Noto
+// Sans" (no script suffix) is Google's own Latin+Cyrillic+Greek family —
+// its coverage extends well past WinAnsi/Latin-1 into Latin Extended-A/B
+// and Latin Extended Additional, which is what actually contains e.g.
+// Polish ń, Czech č, Turkish ğ, Vietnamese diacritics — so it's the
+// general-purpose catch-all for "not CJK, but preferredFont still can't
+// render it" rather than something scoped to one specific language.
+const GOOGLE_FONT_FAMILIES = ["Noto Sans", "Noto Sans KR", "Noto Sans JP", "Noto Sans SC", "Noto Sans TC"];
 
 // A name is written in one language, so classification happens per NAME,
 // not per character — a bare Han character means nothing about which
@@ -748,15 +809,40 @@ function scriptFamilyForName(name) {
 // which Google Font family they'll need, and returns { family: Set<char> }
 // — one Set per family, deduped, so each family is fetched exactly once
 // per generation covering every person who needs it.
+//
+// Classification happens per CHARACTER, except for Han: scriptFamilyForName
+// resolves the whole name's SC/TC/JP bucket once (that genuinely needs
+// whole-name context — see its own comment), reused for every Han
+// character in that name. Every other non-ASCII character (Latin
+// Extended, Cyrillic, Greek, etc.) is classified independently and falls
+// back to the general "Noto Sans" family — this is what a name like
+// "Kolasiński" needs: no Hangul/Kana/Han anywhere in it, so it used to
+// get skipped by this function entirely (scriptFamilyForName(name)
+// returning null for the whole name), leaving its "ń" with no fallback
+// font at all.
 function collectGoogleFontRequirements(persons) {
   const byFamily = {};
+  const add = (family, ch) => {
+    const set = byFamily[family] || (byFamily[family] = new Set());
+    set.add(ch);
+  };
+
   for (const person of persons) {
     const name = person.name || "";
-    const family = scriptFamilyForName(name);
-    if (!family) continue;
-    const set = byFamily[family] || (byFamily[family] = new Set());
+    if (!name) continue;
+    const hanFamily = scriptFamilyForName(name);
+
     for (const ch of name) {
-      if (ch.codePointAt(0) > 0x7f) set.add(ch);
+      if (ch.codePointAt(0) <= 0x7f) continue; // plain ASCII, nothing to fill in
+      if (/[\uAC00-\uD7A3\u1100-\u11FF\u3130-\u318F]/.test(ch)) {
+        add("Noto Sans KR", ch);
+      } else if (/[\u3040-\u30FF]/.test(ch)) {
+        add("Noto Sans JP", ch);
+      } else if (/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/.test(ch)) {
+        add(hanFamily, ch); // SC/TC/JP as resolved for the whole name above
+      } else {
+        add("Noto Sans", ch);
+      }
     }
   }
   return byFamily;
@@ -839,12 +925,53 @@ async function fetchGoogleFontBytes(family, text) {
 // note above, is every time here). Wrapped in withTimeout() regardless —
 // a broken/missing install or any other stall must not hang generation.
 async function embedGoogleFontBytes(pdfDoc, bytes, format) {
+  let sfntBytes = bytes;
   if (format === "woff2") {
     const { default: decompress } = await withTimeout(import("woff2-encoder/decompress"), 8000, "loading the woff2-encoder decompress module");
-    const sfntBytes = await withTimeout(decompress(bytes), 8000, "decompressing WOFF2 to sfnt");
-    return pdfDoc.embedFont(sfntBytes, { subset: true });
+    sfntBytes = await withTimeout(decompress(bytes), 8000, "decompressing WOFF2 to sfnt");
   }
-  return pdfDoc.embedFont(bytes, { subset: true });
+
+  // Wrapped with a real fontkitFont, exactly like manually-uploaded custom
+  // fonts already are (see the state.fonts loop in generateBadgesPdf
+  // below) — this isn't decoration, it fixes a confirmed, reproduced bug.
+  //
+  // canRenderCodePoint's fallback check for a BARE embedded PDFFont
+  // (fontInfo.pdfFont.encodeText(...) wrapped in try/catch) is a false
+  // positive for ANY codepoint on ANY custom-embedded font — verified
+  // directly against real pdf-lib output: encodeText() only actually
+  // THROWS for pdf-lib's own BUILT-IN standard fonts (Helvetica etc,
+  // which are genuinely WinAnsi-limited and correctly report that). For
+  // a font embedded from real font bytes via fontkit, it silently
+  // encodes an unsupported codepoint to glyph 0 (.notdef) instead of
+  // throwing — so the check always said "yes, this font can render it"
+  // regardless of whether that was true.
+  //
+  // That false positive stayed harmless as long as a batch only ever
+  // needed ONE Google-fetched font at a time. It became consequential
+  // the moment a batch needed more than one simultaneously — e.g. "Noto
+  // Sans" for a Polish name's diacritics alongside "Noto Sans SC" for a
+  // Chinese name in the same generation run. fontForChar's fallback loop
+  // hits whichever "local:" font was inserted into fonts.custom first
+  // (fetch order follows GOOGLE_FONT_FAMILIES) and, since the
+  // false-positive check always said yes, stopped right there — even for
+  // a character that font has no glyph for at all. Concretely: it was
+  // picking the Latin-only "Noto Sans" font to "draw" Chinese characters,
+  // which correctly (but uselessly) rendered .notdef — a tofu box — for
+  // every one of them, and ONLY in batches needing both a CJK and a
+  // non-CJK Google-fetched font at once. That's the exact "worked before,
+  // broke after the Polish-name fix added a second family" pattern this
+  // caused. Confirmed directly: without this wrapper, fontForChar picks
+  // "local:Noto Sans" for 朱 (U+6731); with fontkitFont.hasGlyphForCodePoint()
+  // available, it correctly says no and falls through to
+  // "local:Noto Sans SC" as intended.
+  //
+  // subset: false remains deliberate and unrelated to the above — these
+  // fonts already arrive pre-subsetted server-side by Google (the
+  // `text=` param in fetchGoogleFontBytes), so there's nothing
+  // meaningful left for pdf-lib to subset out of an already few-KB file.
+  const fontkitFont = fontkit.create(sfntBytes);
+  const pdfFont = await pdfDoc.embedFont(sfntBytes, { subset: false });
+  return { pdfFont, fontkitFont };
 }
 
 async function loadGoogleScriptFonts(pdfDoc, fonts, persons) {
@@ -897,7 +1024,7 @@ async function drawBackground(page, sideTpl, ctx, pdfDoc, pageWMm, pageHMm, imag
   }
 
   if (!finalDataUrl) return;
-  const embedded = await embedImageCached(pdfDoc, finalDataUrl, imageCache);
+  const embedded = await embedImageCached(pdfDoc, finalDataUrl, imageCache, { width: mmv(pageWMm), height: mmv(pageHMm) });
   if (embedded) {
     page.drawImage(embedded, { x: 0, y: 0, width: mmv(pageWMm), height: mmv(pageHMm) });
   }
@@ -905,22 +1032,47 @@ async function drawBackground(page, sideTpl, ctx, pdfDoc, pageWMm, pageHMm, imag
 
 // --------------------------------------------------------------- person ctx
 
-function personRole(person) {
+// The previous hardcoded version only ever recognized "organizer" and
+// "delegate" from a WCIF person's `roles` array — anyone with a different
+// role (trainee-delegate, staff-judge, staff-scrambler, staff-runner,
+// staff-dataentry, staff-announcer, or any future WCA role string) fell
+// straight through to "competitor" with no way to change that without
+// editing code. roleMapping is now configurable (see the Role Mapping
+// panel in BadgeDesigner.jsx, state.roleMapping): an ORDERED list of
+// {wcaRole, label} rules, checked in order against the person's `roles`
+// array — first match wins, since a person can hold more than one role
+// at once and priority between them is a real choice (e.g. an organizer
+// who is also judging should probably badge as "organizer"). A person
+// matching no rule gets `fallback`. DEFAULT_ROLE_MAPPING below
+// reproduces the old hardcoded behavior exactly, so existing
+// state/templates saved before this feature existed keep working
+// unchanged.
+const DEFAULT_ROLE_MAPPING = {
+  rules: [
+    { wcaRole: "organizer", label: "organizer" },
+    { wcaRole: "delegate", label: "delegate" },
+  ],
+  fallback: "competitor",
+};
+
+function personRole(person, roleMapping) {
   const roles = person.roles || [];
-  if (roles.includes("organizer")) return "organizer";
-  if (roles.includes("delegate")) return "delegate";
-  return "competitor";
+  const mapping = roleMapping && roleMapping.rules ? roleMapping : DEFAULT_ROLE_MAPPING;
+  for (const rule of mapping.rules) {
+    if (rule.wcaRole && roles.includes(rule.wcaRole)) return rule.label || rule.wcaRole;
+  }
+  return mapping.fallback || "competitor";
 }
 
-function buildPersonContext(person, sampleData, competitorSchedules, stages) {
+function buildPersonContext(person, sampleData, competitorSchedules, stages, roleMapping) {
   const ctx = { ...sampleData };
-  const regId = person.registrantId;
+  const regId = person.registrantId || person.wcaId;
   Object.assign(ctx, {
     name: normText(person.name || ""),
-    role: personRole(person),
+    role: personRole(person, roleMapping),
     wcaId: person.wcaId || "",
-    registrantId: regId !== undefined && regId !== null ? String(regId) : "",
-    country: person.countryIso2 || "",
+    registrantId: regId !== undefined && regId !== null && regId !== person.wcaId ? String(regId) : "",
+    countryIso2: person.countryIso2 || "",
     schedules: competitorSchedules[String(regId)] || {},
     stages,
   });
@@ -953,7 +1105,7 @@ export async function generateBadgesPdf(state, wcif, onProgress) {
         const bytes = dataUrlToBytes(f.dataUrl);
 
         const fontkitFont = fontkit.create(bytes);
-        const pdfFont = await pdfDoc.embedFont(bytes, { subset: true });
+        const pdfFont = await pdfDoc.embedFont(bytes, { subset: false });
 
         fonts.custom[f.family] = {
           pdfFont,
@@ -965,7 +1117,7 @@ export async function generateBadgesPdf(state, wcif, onProgress) {
     }
   }
 
-  const competitorSchedules = buildCompetitorSchedules(wcif);
+  const competitorSchedules = buildCompetitorSchedules(wcif, state.scheduleTimezone || undefined);
   const stages = buildStageList(wcif);
 
   const persons = (wcif.persons || []).filter(
@@ -986,7 +1138,7 @@ export async function generateBadgesPdf(state, wcif, onProgress) {
 
   for (let idx = 0; idx < persons.length; idx++) {
     const person = persons[idx];
-    const ctx = buildPersonContext(person, state.sampleData, competitorSchedules, stages);
+    const ctx = buildPersonContext(person, state.sampleData, competitorSchedules, stages, state.roleMapping);
 
     for (const sideKey of ["front", "back"]) {
       const sideTpl = state[sideKey];

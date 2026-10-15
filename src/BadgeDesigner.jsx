@@ -19,8 +19,12 @@ import {
   FileUp,
   KeyRound,
   Printer,
+  GripVertical,
+  ChevronUp,
+  ChevronDown,
+  Users,
 } from "lucide-react";
-import { buildCompetitorSchedules, buildGenericSchedule, buildStageList } from "./schedule.js";
+import { buildCompetitorSchedules, buildGenericSchedule, buildStageList, resolveScheduleTimezone } from "./schedule.js";
 import { generateBadgesPdf, downloadPdfBytes } from "./pdfExport.js";
 
 const SCALE = 5.2; // px per mm
@@ -28,7 +32,215 @@ const MIN_MM = 4;
 const TINT_ID = "__tint__";
 const FONTS_ID = "__fonts__";
 const BGMAP_ID = "__bgmap__";
+const ROLEMAP_ID = "__rolemap__";
+// Country flags, bundled into the project rather than fetched at runtime
+// — put one file per country under src/assets/flags/, named by its WCA
+// countryIso2 code (e.g. assets/flags/PT.svg, assets/flags/US.svg).
+// import.meta.glob is Vite's way to bundle a whole folder of files that
+// aren't individually known ahead of time (unlike the old fixed-list
+// LOCAL_SCRIPT_FONTS pattern this mirrors): it must appear exactly like
+// this, as a literal top-level call, since Vite statically scans the
+// source for it at build time rather than evaluating it at runtime — it
+// can't be moved into a function or have its path built dynamically.
+// `eager: true` resolves every match's URL immediately (no per-file
+// dynamic import), and since .svg isn't a JS module Vite transforms, its
+// default export is simply the built, fingerprinted URL string.
+const FLAG_ASSET_MODULES = import.meta.glob("./assets/flags/*.svg", { eager: true });
+
+// ISO2 code -> resolved asset URL, e.g. { PT: "/assets/PT-a1b2c3.svg", ... }.
+const FLAG_URLS_BY_ISO2 = Object.fromEntries(
+  Object.entries(FLAG_ASSET_MODULES).map(([path, mod]) => {
+    const iso2 = path.split("/").pop().replace(/\.svg$/i, "").toUpperCase();
+    return [iso2, mod.default];
+  })
+);
+
+// Same "who actually gets a badge" filter pdfExport.js's generateBadgesPdf
+// and schedule.js's buildCompetitorSchedules use — accepted competitors,
+// plus unregistered people who still have a staff role — so this doesn't
+// fetch flags for people who won't end up on a badge at all (e.g.
+// waitlisted or cancelled registrations).
+function badgeablePersons(wcif) {
+  return (wcif?.persons || []).filter((p) => (p.registration && p.registration.status === "accepted") || (!p.registration && p.roles && p.roles.length));
+}
+
+function wcifCountryIso2Codes(wcif) {
+  const codes = new Set();
+  for (const person of badgeablePersons(wcif)) {
+    if (person.countryIso2) codes.add(person.countryIso2);
+  }
+  return codes;
+}
+
+async function fetchFlagDataUrl(iso2) {
+  const url = FLAG_URLS_BY_ISO2[iso2];
+  if (!url) return null;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching bundled flag for "${iso2}"`);
+  const blob = await res.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function fetchFlagMappingEntries(wcif) {
+  const codes = [...wcifCountryIso2Codes(wcif)];
+  const missing = codes.filter((c) => !FLAG_URLS_BY_ISO2[c]);
+  if (missing.length) console.warn(`No bundled flag found for: ${missing.join(", ")} — expected src/assets/flags/<ISO2>.svg for each in the project.`);
+
+  const fetched = await Promise.all(
+    codes
+      .filter((c) => FLAG_URLS_BY_ISO2[c])
+      .map(async (c) => {
+        try {
+          const dataUrl = await fetchFlagDataUrl(c);
+          return { value: c, path: `assets/flags/${c}.svg`, preview: dataUrl };
+        } catch (e) {
+          console.warn(`Could not load bundled flag for "${c}"`, e);
+          return null;
+        }
+      })
+  );
+  return fetched.filter(Boolean);
+}
+
+// For every image field configured as "driven by country" (mapped &&
+// mapSource === "country" — that's the existing UI's own signal of
+// intent, so no separate "this is the flag field" toggle is needed),
+// upserts one mapping entry per country actually present in the WCIF
+// (see upsertMappingsByValue, shared with the manual bulk-upload
+// feature). Existing mappings for countries no longer present are left
+// alone rather than removed, so a field can carry countries from more
+// than one WCIF load without needing to be reset each time.
+async function syncCountryFlagFields(fields, wcif) {
+  const needsSync = fields.filter((f) => f.type === "image" && f.mapped && f.mapSource === "countryIso2");
+  if (needsSync.length === 0) return fields;
+  const entries = await fetchFlagMappingEntries(wcif);
+  return fields.map((f) => (needsSync.includes(f) ? { ...f, mappings: upsertMappingsByValue(f.mappings, entries) } : f));
+}
+
 const BUILTIN_FONTS = ["Helvetica", "Helvetica-Bold"];
+
+// QR fields don't have independent w_mm/h_mm — they're square, sized by a
+// single size_mm (see drawQrField in pdfExport.js, the only thing that
+// actually determines the real exported size). Every place that reads a
+// field's box dimensions for layout purposes — the canvas preview,
+// drag/resize, snap-to-edge alignment, centering — needs to go through
+// these rather than field.w_mm/h_mm directly, or a QR field silently
+// falls back to the generic defaults (20mm / 8mm) instead of its actual
+// size, which is exactly what made the on-canvas box (and everything
+// derived from it) disagree with what actually gets exported.
+// Text fields need the same treatment, for a different reason: FieldBox
+// renders a non-wrap text field at width "auto" (sized to its actual
+// content, not any stored w_mm) and ANY text field — wrapped or not — at
+// height "auto" (always content-driven; only width is ever a real fixed
+// box, and only when wrapped). Before this, a non-wrap text field still
+// got the generic 20mm/8mm fallback here, so its drag bounds and the
+// page-center snap point were computed against a box that didn't match
+// what was actually on screen — which is what made dragging some text
+// fields feel like it stuck partway across the canvas: the snap/clamp
+// math was aiming for where a 20mm-wide box would need to be centered,
+// not where the real (auto-sized) field visually was.
+function fieldBoxWidthMm(field) {
+  if (field.type === "qr") return field.size_mm || 16;
+  if (field.type === "text") return field.wrap ? field.w_mm || 60 : 0;
+  return field.w_mm || 20;
+}
+function fieldBoxHeightMm(field) {
+  if (field.type === "qr") return field.size_mm || 16;
+  if (field.type === "text") return 0;
+  return field.h_mm || 8;
+}
+
+// One-click Google Fonts you can add without hunting down a .ttf file
+// yourself. Each preset fetches one specific weight of the family as a
+// separate selectable "font" — same convention as the built-in Helvetica /
+// Helvetica-Bold pair, where weight is a distinct font choice rather than
+// a toggle. Add more entries here to offer more presets later.
+const GOOGLE_FONT_PRESETS = [
+  { label: "Rubik", family: "Rubik", weight: "400" },
+  { label: "Rubik Bold", family: "Rubik", weight: "700" },
+];
+
+// Wraps a promise with a hard deadline: without this, a stalled network
+// request or a broken WASM module init can hang silently forever with
+// nothing to catch it (see the equivalent, more-detailed comment on
+// withTimeout in pdfExport.js — same reasoning applies here).
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timed out after ${ms}ms: ${label}`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+// Chunked to avoid blowing the call stack on String.fromCharCode.apply
+// for a multi-hundred-KB font file.
+function bytesToBase64(bytes) {
+  const CHUNK = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+// Fetches one weight of a Google Font as a FULL family (no `text=`
+// subsetting) — this is for a font the person picks for arbitrary,
+// not-yet-known text (any competitor's name, any static/template string),
+// unlike the per-character subsetted fetch in pdfExport.js's automatic
+// script-fallback system, which only ever needs specific already-known
+// characters. Returns a data: URL in the same shape FileReader.
+// readAsDataURL produces for a manually-uploaded file, since the rest of
+// the app (embedding, live preview, template export) expects exactly
+// that shape regardless of where the font actually came from.
+async function fetchGoogleFontFamilyDataUrl(family, weight) {
+  const cssUrl = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(family)}:wght@${weight}&display=swap`;
+  const cssRes = await withTimeout(fetch(cssUrl, { mode: "cors" }), 8000, `Google Fonts CSS request for "${family}" ${weight}`);
+  if (!cssRes.ok) throw new Error(`HTTP ${cssRes.status} fetching Google Fonts CSS for "${family}"`);
+  const css = await cssRes.text();
+
+  // Without a `text=` param (this needs the family's full Latin coverage
+  // for arbitrary, not-yet-known text, unlike pdfExport.js's per-character
+  // subsetted fetch for already-known names), Google returns ONE
+  // @font-face block PER SCRIPT SUBSET the family supports — cyrillic,
+  // vietnamese, latin, latin-ext, etc. — not one block for the whole
+  // family, each labeled with a trailing "/* subsetname */" comment. A
+  // naive first-match would silently grab whichever subset happens to be
+  // listed first (commonly NOT latin — real responses list latin last).
+  // We need a single static file to embed as one selectable font, so this
+  // explicitly picks "latin-ext" (a superset of "latin": Latin-1 + Latin
+  // Extended-A/B, covering Polish, Czech, Turkish, etc.) if present, else
+  // falls back to plain "latin", else whatever block exists at all.
+  const blocks = [...css.matchAll(/@font-face\s*\{([^}]*)\}\s*\/\*\s*([\w-]+)\s*\*\//g)].map(([, body, label]) => ({ body, label }));
+  const chosen = blocks.find((b) => b.label === "latin-ext") || blocks.find((b) => b.label === "latin") || blocks[0];
+  if (!chosen) throw new Error(`Google Fonts CSS for "${family}" had no @font-face blocks in it: ${css.slice(0, 200)}`);
+
+  const urlMatch = chosen.body.match(/url\((https:\/\/fonts\.gstatic\.com[^)]+)\)\s*format\('(\w+)'\)/);
+  if (!urlMatch) throw new Error(`Google Fonts CSS for "${family}" (${chosen.label} subset) had no usable font url in it`);
+  const [, fontUrl, format] = urlMatch;
+
+  const fontRes = await withTimeout(fetch(fontUrl, { mode: "cors" }), 8000, `Google Fonts file download for "${family}"`);
+  if (!fontRes.ok) throw new Error(`HTTP ${fontRes.status} fetching the font file for "${family}"`);
+  const rawBytes = new Uint8Array(await fontRes.arrayBuffer());
+
+  // Browser fetch() always gets WOFF2 back from Google (it can't override
+  // the User-Agent header, which is what Google sniffs to decide format —
+  // see the matching note in pdfExport.js), so this needs decompressing
+  // to a real sfnt before it's usable as a font file elsewhere in the app.
+  let sfntBytes = rawBytes;
+  if (format === "woff2") {
+    const { default: decompress } = await withTimeout(import("woff2-encoder/decompress"), 8000, "loading the woff2-encoder decompress module");
+    sfntBytes = await withTimeout(decompress(rawBytes), 8000, "decompressing WOFF2 to sfnt");
+  }
+
+  return `data:font/ttf;base64,${bytesToBase64(sfntBytes)}`;
+}
 
 // ---------------------------------------------------------------------
 // Schedule field appearance — edit these to restyle the schedule table.
@@ -74,8 +286,8 @@ const TASKKEY_TASKS = [
   { code: "S", label: "Scrambler" },
 ];
 const TASKKEY_FALLBACK_STAGES = [
-  { name: "Stage 1", color: "#1E5FD9" },
-  { name: "Stage 2", color: "#B8860B" },
+  { name: "Stage 1", color: "#63f153" },
+  { name: "Stage 2", color: "#da3f39" },
 ];
 
 const PAGE_PRESETS = [
@@ -173,8 +385,30 @@ function resolveMapping(field, sampleData, kind) {
   return found || null;
 }
 
+function isValidTimezone(tz) {
+  if (!tz) return true; // empty = "auto", always valid
+  try {
+    new Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function resolveTemplate(template, sampleData) {
-  return (template || "").replace(/\{(\w+)\}/g, (_, k) => (sampleData[k] !== undefined ? sampleData[k] : `{${k}}`));
+  return (template || "").replace(/\{(\w+)(?:\|([^}]*))?\}/g, (_, k, fallback) => {
+    const has = Object.prototype.hasOwnProperty.call(sampleData, k);
+    const v = sampleData[k];
+    const isEmpty = v === undefined || v === null || v === "";
+    // Unknown key with no fallback given: keep the literal placeholder
+    // visible, since that's almost always a typo worth surfacing rather
+    // than silently blanking out. Once a fallback is present — even for
+    // an unknown key — it's clearly intentional ("use this text when
+    // there's nothing to show"), so honor it.
+    if (!has && fallback === undefined) return `{${k}}`;
+    if (isEmpty) return fallback !== undefined ? fallback : "";
+    return v;
+  });
 }
 
 function resolveTextValue(field, sampleData) {
@@ -201,9 +435,9 @@ function defaultTint() {
     mapSource: "role",
     fallbackColor: "#1E5FD9",
     mappings: [
-      { value: "competitor", color: "#1E5FD9" },
-      { value: "delegate", color: "#B8860B" },
-      { value: "organizer", color: "#7B2CBF" },
+      { value: "competitor", color: "#38dc35" },
+      { value: "delegate", color: "#d53a3a" },
+      { value: "organizer", color: "#463be5" },
     ],
   };
 }
@@ -257,7 +491,7 @@ function initialState() {
       role: "competitor",
       wcaId: "2018AZEV03",
       registrantId: "1",
-      country: "PT",
+      countryIso2: "PT",
       // No seeded schedule on purpose: until a WCIF is loaded (via "Load WCIF
       // JSON"), the schedule field renders its own generic placeholder rows
       // (see the schedule branch in FieldBox). Loading a WCIF fills this with
@@ -271,8 +505,50 @@ function initialState() {
       stages: [],
     },
 
+    // Empty = auto: use the competition venue's own timezone from the WCIF
+    // (Venue.timezone, an Olson/IANA name — see resolveScheduleTimezone in
+    // schedule.js). Set explicitly to override it, e.g. if the WCIF's
+    // venue.timezone is missing/wrong, or to preview in a different zone.
+    scheduleTimezone: "",
+
+    // Maps a WCIF person's `roles` array (they can hold more than one at
+    // once, e.g. an organizer who's also a judge) down to the single
+    // "role" value used throughout the template (text mappings, tint,
+    // background images, etc. — see the "ROLE FIELDS" panel). Rules are
+    // checked in order; the first one whose wcaRole appears in the
+    // person's roles wins, so priority between roles is an explicit
+    // choice rather than code. Anyone matching no rule gets `fallback`.
+    // Mirrors DEFAULT_ROLE_MAPPING in pdfExport.js exactly, so a template
+    // saved before this feature existed keeps behaving the same way.
+    roleMapping: {
+      rules: [
+        { wcaRole: "organizer", label: "organizer" },
+        { wcaRole: "delegate", label: "delegate" },
+      ],
+      fallback: "competitor",
+    },
+
     fonts: [],
     front: defaultSide(105, 148, [
+      {
+        id: uid("colorblock"),
+        type: "colorblock",
+        x_mm: 0,
+        y_mm: 0,
+        w_mm: 105,
+        h_mm: 148,
+        rotate: 0,
+        mapSource: "role",
+        fallbackColor: "#9CA3AF",
+        opacity: 100,
+        mappings: [
+          { value: "competitor", color: "#5A8F2E" },
+          { value: "delegate", color: "#ec1b1b" },
+          { value: "organizer", color: "#4552e2" },
+        ],
+        labelSource: null,
+        labelColor: "#FFFFFF",
+      },
       {
         id: uid("text"),
         type: "text",
@@ -331,25 +607,6 @@ function initialState() {
         w_mm: 90,
       },
       { id: uid("text"), type: "text", x_mm: 52, y_mm: 140, rotate: 0, ...textFieldDefaults(), bindMode: "static", staticText: "WCA EURO 2026 · ARNHEM NL", font: "Helvetica", size: 7, color: "#FFFFFF", align: "center" },
-      {
-        id: uid("colorblock"),
-        type: "colorblock",
-        x_mm: 0,
-        y_mm: 0,
-        w_mm: 105,
-        h_mm: 148,
-        rotate: 0,
-        mapSource: "role",
-        fallbackColor: "#9CA3AF",
-        opacity: 100,
-        mappings: [
-          { value: "competitor", color: "#5A8F2E" },
-          { value: "delegate", color: "#B8860B" },
-          { value: "organizer", color: "#7B2CBF" },
-        ],
-        labelSource: null,
-        labelColor: "#FFFFFF",
-      },
     ]),
     back: defaultSide(148, 105, [
       { id: uid("text"), type: "text", x_mm: 6, y_mm: 6, rotate: 90, ...textFieldDefaults(), bindMode: "field", source: "registrantId", customPrefix: "#", font: "Helvetica-Bold", size: 11, color: "#141414" },
@@ -500,6 +757,17 @@ function inflateTemplate(data) {
 
   return {
     sampleData: data.sample_data || { name: "Sample Name" },
+    scheduleTimezone: data.schedule_timezone || "",
+    // A template saved before this feature existed won't have role_mapping
+    // at all — default reproduces the old hardcoded organizer/delegate
+    // behavior exactly (see DEFAULT_ROLE_MAPPING in pdfExport.js).
+    roleMapping: data.role_mapping || {
+      rules: [
+        { wcaRole: "organizer", label: "organizer" },
+        { wcaRole: "delegate", label: "delegate" },
+      ],
+      fallback: "competitor",
+    },
     fonts: inflatedFonts,
     front: inflateSide(data.front, 105, 148),
     back: inflateSide(data.back, 148, 105),
@@ -545,8 +813,14 @@ export default function BadgeDesigner() {
       // never a specific person's actual assignments. Real per-competitor
       // data (and buildCompetitorSchedules) only gets used later, in batch
       // generation, once this template is applied to the whole roster.
-      const genericSchedule = buildGenericSchedule(wcif);
+      const genericSchedule = buildGenericSchedule(wcif, state.scheduleTimezone || undefined);
       const stages = buildStageList(wcif);
+
+      // Populates any "driven by country" image field's mappings from the
+      // flags actually needed for this WCIF's competitors (see
+      // syncCountryFlagFields) — both sides, independently of which one is
+      // currently showing.
+      const [frontFields, backFields] = await Promise.all([syncCountryFlagFields(state.front.fields, wcif), syncCountryFlagFields(state.back.fields, wcif)]);
 
       setState((prev) => ({
         ...prev,
@@ -556,6 +830,8 @@ export default function BadgeDesigner() {
           schedules: genericSchedule, // Map of "YYYY-MM-DD" -> placeholder row array
           stages, // [{ name, color }, ...] — used by the Task Key field's stage column
         },
+        front: { ...prev.front, fields: frontFields },
+        back: { ...prev.back, fields: backFields },
       }));
 
       return true;
@@ -582,12 +858,28 @@ export default function BadgeDesigner() {
   const dragRef = useRef(null);
   const sideData = state[side];
   const fields = sideData.fields;
-  const selectedField = selectedId && selectedId !== TINT_ID && selectedId !== FONTS_ID && selectedId !== BGMAP_ID ? fields.find((f) => f.id === selectedId) : null;
+  const selectedField = selectedId && selectedId !== TINT_ID && selectedId !== FONTS_ID && selectedId !== BGMAP_ID && selectedId !== ROLEMAP_ID ? fields.find((f) => f.id === selectedId) : null;
 
   const updateSide = (patch) => setState((s) => ({ ...s, [side]: { ...s[side], ...patch } }));
   const updateField = (id, patch) => updateSide({ fields: sideData.fields.map((f) => (f.id === id ? { ...f, ...patch } : f)) });
+
+  // Manual re-sync for a single field — for when mapSource is set to
+  // "country" AFTER a WCIF is already loaded (the automatic sync in
+  // loadWcifData only fires at load time), or to pick up newly-added
+  // flag files under src/assets/flags/ without reloading the WCIF.
+  const syncCountryFlagsForField = async (fieldId) => {
+    if (!state.wcif) {
+      alert("Load a WCIF first (the \"Load WCIF JSON\" control) — flags are fetched per the competitors it contains.");
+      return;
+    }
+    const entries = await fetchFlagMappingEntries(state.wcif);
+    updateField(fieldId, { mappings: upsertMappingsByValue(sideData.fields.find((f) => f.id === fieldId)?.mappings || [], entries) });
+  };
   const updateTint = (patch) => updateSide({ tint: { ...sideData.tint, ...patch } });
   const updateBackgroundMap = (patch) => updateSide({ backgroundMap: { ...sideData.backgroundMap, ...patch } });
+  // Global, not per-side (like scheduleTimezone) — a person's role doesn't
+  // change between the front and back of their own badge.
+  const updateRoleMapping = (patch) => setState((s) => ({ ...s, roleMapping: { ...s.roleMapping, ...patch } }));
 
   const addField = (type) => {
     const count = fields.filter((f) => f.type === type).length;
@@ -610,6 +902,62 @@ export default function BadgeDesigner() {
     if (selectedId === id) setSelectedId(null);
   };
 
+  // Field DEPTH (stacking order): both the canvas preview (fields.map at
+  // render time — later array entries land later in the DOM, so they sit
+  // visually on top) and pdfExport.js's draw loop (later entries painted
+  // last onto the same PDF page) already treat `fields` array order as
+  // depth order, back-to-front. So reordering is really just "let the
+  // user rearrange this array" — nothing downstream needs to change.
+  //
+  // The sidebar list is shown reversed relative to storage, so the TOP
+  // row is the FRONTMOST field (last in the actual array) — matching the
+  // usual layers-panel convention (Figma, Photoshop, etc.), rather than
+  // the less intuitive "front = bottom of the list".
+  const [draggingFieldId, setDraggingFieldId] = useState(null);
+
+  const reorderFields = (draggedId, targetId) => {
+    if (draggedId === targetId) return;
+    const displayOrder = [...fields].reverse();
+    const fromIdx = displayOrder.findIndex((f) => f.id === draggedId);
+    const toIdx = displayOrder.findIndex((f) => f.id === targetId);
+    if (fromIdx === -1 || toIdx === -1) return;
+    const [moved] = displayOrder.splice(fromIdx, 1);
+    displayOrder.splice(toIdx, 0, moved);
+    updateSide({ fields: [...displayOrder].reverse() });
+  };
+
+  // dir: -1 moves one step up the visible list (more toward the front),
+  // +1 moves one step down (more toward the back).
+  const moveFieldInList = (id, dir) => {
+    const displayOrder = [...fields].reverse();
+    const idx = displayOrder.findIndex((f) => f.id === id);
+    if (idx === -1) return;
+    const newIdx = idx + dir;
+    if (newIdx < 0 || newIdx >= displayOrder.length) return;
+    [displayOrder[idx], displayOrder[newIdx]] = [displayOrder[newIdx], displayOrder[idx]];
+    updateSide({ fields: [...displayOrder].reverse() });
+  };
+
+  // Global (not per-field): every schedule field shows the same
+  // competition, so they all share one timezone. Empty string means
+  // "auto" — resolveScheduleTimezone() falls back to the WCIF venue's own
+  // timezone in that case. Changing this re-derives sampleData.schedules
+  // from the already-loaded raw WCIF (state.wcif) so the live preview
+  // updates immediately, without needing to reload the WCIF file.
+  const setScheduleTimezone = (tz) => {
+    setState((prev) => {
+      const next = { ...prev, scheduleTimezone: tz };
+      if (prev.wcif) {
+        next.sampleData = {
+          ...prev.sampleData,
+          schedules: buildGenericSchedule(prev.wcif, tz || undefined),
+        };
+      }
+      return next;
+    });
+  };
+  const detectedScheduleTimezone = state.wcif ? resolveScheduleTimezone(state.wcif) : null;
+
   const round1 = (v) => Math.round(v * 10) / 10;
   const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
   const stateRef = useRef(state);
@@ -621,7 +969,7 @@ export default function BadgeDesigner() {
     e.stopPropagation();
     e.preventDefault();
     setSelectedId(field.id);
-    dragRef.current = { id: field.id, mode, type: field.type, startX: e.clientX, startY: e.clientY, origX: field.x_mm, origY: field.y_mm, origW: field.w_mm || 20, origH: field.h_mm || 8 };
+    dragRef.current = { id: field.id, mode, type: field.type, startX: e.clientX, startY: e.clientY, origX: field.x_mm, origY: field.y_mm, origW: fieldBoxWidthMm(field), origH: fieldBoxHeightMm(field) };
     window.addEventListener("pointermove", onDragMove);
     window.addEventListener("pointerup", onDragEnd);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -649,14 +997,14 @@ export default function BadgeDesigner() {
       const candX = [
         (pw - w) / 2,
         ...others.flatMap((f) => {
-          const fw = f.w_mm || (f.type === "text" ? 0 : 20);
+          const fw = fieldBoxWidthMm(f); // 0 for a non-wrap text field, its real box width when wrapped
           return [f.x_mm, f.x_mm + fw - w, f.x_mm + fw / 2 - w / 2];
         }),
       ];
       const candY = [
         (ph - h) / 2,
         ...others.flatMap((f) => {
-          const fh = f.h_mm || 8;
+          const fh = fieldBoxHeightMm(f);
           return [f.y_mm, f.y_mm + fh - h, f.y_mm + fh / 2 - h / 2];
         }),
       ];
@@ -687,6 +1035,16 @@ export default function BadgeDesigner() {
       if (d.type === "schedule" || d.type === "taskkey") {
         // Height is derived, not draggable — width only.
         applyFieldPatch(d.id, { w_mm: round1(nw) });
+      } else if (d.type === "qr") {
+        // QR codes must stay square — a single size_mm, not independent
+        // width/height (see drawQrField in pdfExport.js, which only ever
+        // reads size_mm). Whichever axis the pointer moved further along
+        // wins, so dragging diagonally, horizontally, or vertically from
+        // the corner handle all behave the same way.
+        const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
+        const newSize = Math.abs(nw - d.origW) >= Math.abs(nh - d.origH) ? nw : nh;
+        const maxSize = Math.min(pw - d.origX, ph - d.origY);
+        applyFieldPatch(d.id, { size_mm: round1(clamp(newSize, MIN_MM, maxSize)) });
       } else {
         const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
         applyFieldPatch(d.id, { w_mm: round1(nw), h_mm: round1(nh) });
@@ -747,6 +1105,29 @@ export default function BadgeDesigner() {
   };
   const renameFontDisplay = (id, displayName) => setState((s) => ({ ...s, fonts: s.fonts.map((f) => (f.id === id ? { ...f, displayName } : f)) }));
   const removeFont = (id) => setState((s) => ({ ...s, fonts: s.fonts.filter((f) => f.id !== id) }));
+
+  const [addingGoogleFont, setAddingGoogleFont] = useState(null); // preset.label currently being fetched, or null
+  const addGoogleFontPreset = async (preset) => {
+    setAddingGoogleFont(preset.label);
+    try {
+      const dataUrl = await fetchGoogleFontFamilyDataUrl(preset.family, preset.weight);
+      const family = `custom-${preset.label.replace(/\s+/g, "")}-${uid("f")}`.replace(/[^a-zA-Z0-9_-]/g, "");
+      try {
+        const face = new FontFace(family, `url(${dataUrl})`);
+        await face.load();
+        document.fonts.add(face);
+      } catch (err) {
+        console.error("Font failed to load", err);
+      }
+      setState((s) => ({ ...s, fonts: [...s.fonts, { id: uid("font"), family, displayName: preset.label, filename: `${preset.family}-${preset.weight}.ttf`, dataUrl }] }));
+    } catch (e) {
+      console.error(`Could not fetch "${preset.label}" from Google Fonts`, e);
+      alert(`Could not fetch "${preset.label}" from Google Fonts. Check your network connection and try again.`);
+    } finally {
+      setAddingGoogleFont(null);
+    }
+  };
+
   const allFontOptions = [...BUILTIN_FONTS, ...state.fonts.map((f) => f.family)];
   const fontLabel = (family) => state.fonts.find((f) => f.family === family)?.displayName || family;
 
@@ -813,6 +1194,8 @@ export default function BadgeDesigner() {
 
     const out = {
       sample_data: state.sampleData,
+      schedule_timezone: state.scheduleTimezone || "",
+      role_mapping: state.roleMapping,
       fonts: fontsManifest,
       front: {
         page: state.front.page,
@@ -965,6 +1348,10 @@ export default function BadgeDesigner() {
           <Type size={12} /> Fonts
         </button>
 
+        <button onClick={() => setSelectedId(ROLEMAP_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === ROLEMAP_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
+          <Users size={12} /> Role mapping
+        </button>
+
         <div className="flex-1" />
 
         <button onClick={() => setShowData((v) => !v)} className="flex items-center gap-1.5 text-sm px-3 py-1.5 border border-neutral-300 rounded-md hover:bg-neutral-50">
@@ -1074,21 +1461,66 @@ export default function BadgeDesigner() {
             </div>
 
             <div className="p-4 border-b border-neutral-200 max-h-48 overflow-y-auto">
-              <div className="text-xs font-semibold text-neutral-500 mb-2">{side.toUpperCase()} FIELDS</div>
+              <div className="text-xs font-semibold text-neutral-500 mb-0.5">{side.toUpperCase()} FIELDS</div>
+              <div className="text-[10px] text-neutral-400 mb-2">Drag to reorder, or use the arrows — top is frontmost</div>
               <div className="space-y-1">
-                {fields.map((f) => {
+                {[...fields].reverse().map((f, displayIdx, displayArr) => {
                   const Icon = TYPE_META[f.type].icon;
                   const fieldLabel = f.type === "text" ? (f.bindMode === "static" ? `"${(f.staticText || "").slice(0, 16)}"` : f.bindMode === "template" ? f.template || "(template)" : f.source) : TYPE_META[f.type].label;
                   return (
-                    <div key={f.id} onClick={() => setSelectedId(f.id)} className={`flex items-center gap-2 px-2 py-1.5 rounded-md text-sm cursor-pointer ${selectedId === f.id ? "bg-blue-50 text-blue-700" : "hover:bg-neutral-50 text-neutral-700"}`}>
-                      <Icon size={14} />
+                    <div
+                      key={f.id}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.effectAllowed = "move";
+                        setDraggingFieldId(f.id);
+                      }}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "move";
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (draggingFieldId) reorderFields(draggingFieldId, f.id);
+                        setDraggingFieldId(null);
+                      }}
+                      onDragEnd={() => setDraggingFieldId(null)}
+                      onClick={() => setSelectedId(f.id)}
+                      className={`flex items-center gap-1.5 px-2 py-1.5 rounded-md text-sm cursor-pointer ${selectedId === f.id ? "bg-blue-50 text-blue-700" : "hover:bg-neutral-50 text-neutral-700"} ${draggingFieldId === f.id ? "opacity-40" : ""}`}
+                    >
+                      <GripVertical size={13} className="text-neutral-300 cursor-grab shrink-0" />
+                      <Icon size={14} className="shrink-0" />
                       <span className="flex-1 truncate">{fieldLabel}</span>
+                      <div className="flex flex-col shrink-0">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            moveFieldInList(f.id, -1);
+                          }}
+                          disabled={displayIdx === 0}
+                          className="text-neutral-400 hover:text-neutral-700 disabled:opacity-20 disabled:hover:text-neutral-400 leading-none"
+                          title="Bring forward"
+                        >
+                          <ChevronUp size={13} />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            moveFieldInList(f.id, 1);
+                          }}
+                          disabled={displayIdx === displayArr.length - 1}
+                          className="text-neutral-400 hover:text-neutral-700 disabled:opacity-20 disabled:hover:text-neutral-400 leading-none"
+                          title="Send backward"
+                        >
+                          <ChevronDown size={13} />
+                        </button>
+                      </div>
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
                           removeField(f.id);
                         }}
-                        className="text-neutral-400 hover:text-red-500"
+                        className="text-neutral-400 hover:text-red-500 shrink-0"
                       >
                         <Trash2 size={13} />
                       </button>
@@ -1101,7 +1533,17 @@ export default function BadgeDesigner() {
 
             {selectedId === TINT_ID && <TintPanel tint={sideData.tint} sampleData={state.sampleData} onChange={updateTint} />}
             {selectedId === BGMAP_ID && <BackgroundMapPanel bgMap={sideData.backgroundMap} sampleData={state.sampleData} onChange={updateBackgroundMap} />}
-            {selectedId === FONTS_ID && <FontsPanel fonts={state.fonts} onUpload={uploadFont} onRename={renameFontDisplay} onRemove={removeFont} />}
+            {selectedId === FONTS_ID && (
+              <FontsPanel
+                fonts={state.fonts}
+                onUpload={uploadFont}
+                onRename={renameFontDisplay}
+                onRemove={removeFont}
+                onAddGooglePreset={addGoogleFontPreset}
+                addingGoogleFont={addingGoogleFont}
+              />
+            )}
+            {selectedId === ROLEMAP_ID && <RoleMappingPanel roleMapping={state.roleMapping} onChange={updateRoleMapping} />}
             {selectedField && (
               <PropertiesPanel
                 field={selectedField}
@@ -1111,6 +1553,11 @@ export default function BadgeDesigner() {
                 pageWidth={sideData.page.width_mm}
                 pageHeight={sideData.page.height_mm}
                 onChange={(patch) => updateField(selectedField.id, patch)}
+                scheduleTimezone={state.scheduleTimezone}
+                detectedScheduleTimezone={detectedScheduleTimezone}
+                onScheduleTimezoneChange={setScheduleTimezone}
+                onSyncCountryFlags={() => syncCountryFlagsForField(selectedField.id)}
+                hasWcif={!!state.wcif}
               />
             )}
           </div>
@@ -1121,7 +1568,7 @@ export default function BadgeDesigner() {
 }
 
 function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPointerDownResize }) {
-  const w = (field.w_mm || 20) * scale;
+  const w = fieldBoxWidthMm(field) * scale;
   const textWraps = field.type === "text" && field.wrap;
   const align = field.align || "left";
 
@@ -1149,7 +1596,7 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
     taskKeyHeightPx = TASKKEY_HEADER_HEIGHT_PX + rowCount * TASKKEY_ROW_HEIGHT_PX;
   }
 
-  const h = field.type === "schedule" ? scheduleHeightPx : field.type === "taskkey" ? taskKeyHeightPx : (field.h_mm || 8) * scale;
+  const h = field.type === "schedule" ? scheduleHeightPx : field.type === "taskkey" ? taskKeyHeightPx : fieldBoxHeightMm(field) * scale;
 
   const style = {
     position: "absolute",
@@ -1280,7 +1727,6 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
                 if (block.type === "qr-group") {
                   const rows = block.rows;
                   const groupHeight = rows.length * SCHEDULE_ROW_HEIGHT_PX;
-                  const groupColor = rows.find((r) => r.color)?.color || null;
                   return (
                     <div key={bi} className="flex items-stretch bg-white shrink-0" style={{ height: groupHeight, boxSizing: "border-box", borderTop }}>
                       {/* Left: stacked Time+Event pairs, one per merged row */}
@@ -1300,10 +1746,13 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
                           </div>
                         ))}
                       </div>
-                      {/* Right: one merged Task cell reading "QR" */}
+                      {/* Right: one merged Task cell reading "QR" — always
+                          plain white background, never tinted by the
+                          row's stage color (that tint is for the task
+                          code cells like "C"/"J"/"R"/"S", not a QR slot). */}
                       <div
-                        className="w-9 flex items-center justify-center font-bold shrink-0 px-0.5"
-                        style={{ fontSize: SCHEDULE_QR_FONT_SIZE_PX, backgroundColor: groupColor ? hexToRgba(groupColor, SCHEDULE_COLORS.taskCellTint) : undefined }}
+                        className="w-9 flex items-center justify-center font-bold shrink-0 px-0.5 bg-white"
+                        style={{ fontSize: SCHEDULE_QR_FONT_SIZE_PX }}
                       >
                         QR
                       </div>
@@ -1462,7 +1911,40 @@ function AlignField({ value, onChange }) {
   );
 }
 
-function MappingEditor({ mapSource, mappings, kind, sampleKeys, onSourceChange, onAdd, onUpdate, onRemove }) {
+// Shared by every "value -> image" mapping UI (the mapped image field,
+// background-images-by-value): reads a batch of files at once and derives
+// each mapping's `value` straight from the filename (extension stripped),
+// so a folder of e.g. "PT.png", "US.png", "BR.png" becomes one mapping per
+// country with zero manual typing — built for the country-flag-per-field
+// use case, but works for any file-per-value folder.
+function readImageFilesAsMappingEntries(fileList) {
+  const files = Array.from(fileList || []);
+  return Promise.all(
+    files.map(
+      (file) =>
+        new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const value = file.name.replace(/\.[^./]+$/, ""); // "PT.png" -> "PT"
+            resolve({ value, path: `assets/${file.name}`, preview: reader.result });
+          };
+          reader.readAsDataURL(file);
+        })
+    )
+  );
+}
+
+// Merges freshly-read entries into the existing mapping list by `value` —
+// an entry whose value already exists gets its image replaced in place
+// rather than appended as a duplicate, so re-running a bulk upload (e.g.
+// after fixing one flag file) is safe to repeat.
+function upsertMappingsByValue(existing, newEntries) {
+  const byValue = new Map(existing.map((m) => [m.value, m]));
+  for (const entry of newEntries) byValue.set(entry.value, { ...byValue.get(entry.value), ...entry });
+  return Array.from(byValue.values());
+}
+
+function MappingEditor({ mapSource, mappings, kind, sampleKeys, onSourceChange, onAdd, onUpdate, onRemove, onBulkFiles }) {
   return (
     <div>
       <SelectField label={`${kind === "color" ? "Color" : "Image"} driven by`} value={mapSource} onChange={onSourceChange} options={sampleKeys} />
@@ -1482,9 +1964,26 @@ function MappingEditor({ mapSource, mappings, kind, sampleKeys, onSourceChange, 
           </div>
         ))}
       </div>
-      <button onClick={onAdd} className="mt-1.5 flex items-center gap-1 text-xs text-blue-600 hover:underline">
-        <Plus size={11} /> Add mapping
-      </button>
+      <div className="flex items-center gap-3 mt-1.5">
+        <button onClick={onAdd} className="flex items-center gap-1 text-xs text-blue-600 hover:underline">
+          <Plus size={11} /> Add mapping
+        </button>
+        {kind === "image" && onBulkFiles && (
+          <label className="flex items-center gap-1 text-xs text-blue-600 hover:underline cursor-pointer">
+            <Upload size={11} /> Bulk upload by filename
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files?.length) onBulkFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
+          </label>
+        )}
+      </div>
     </div>
   );
 }
@@ -1558,6 +2057,7 @@ function BackgroundMapPanel({ bgMap, sampleData, onChange }) {
         onAdd={() => onChange({ mappings: [...bgMap.mappings, { value: "new_value", path: "", preview: null }] })}
         onUpdate={updateEntry}
         onRemove={(i) => onChange({ mappings: bgMap.mappings.filter((_, idx) => idx !== i) })}
+        onBulkFiles={(fileList) => readImageFilesAsMappingEntries(fileList).then((entries) => onChange({ mappings: upsertMappingsByValue(bgMap.mappings, entries) }))}
       />
       <div>
         <div className="text-[11px] text-neutral-500 mb-1">Fallback background (unmatched values)</div>
@@ -1578,12 +2078,88 @@ function BackgroundMapPanel({ bgMap, sampleData, onChange }) {
   );
 }
 
-function FontsPanel({ fonts, onUpload, onRename, onRemove }) {
+function RoleMappingPanel({ roleMapping, onChange }) {
+  const rules = roleMapping.rules || [];
+
+  const updateRule = (i, patch) => onChange({ rules: rules.map((r, idx) => (idx === i ? { ...r, ...patch } : r)) });
+  const addRule = () => onChange({ rules: [...rules, { wcaRole: "", label: "" }] });
+  const removeRule = (i) => onChange({ rules: rules.filter((_, idx) => idx !== i) });
+  const moveRule = (i, dir) => {
+    const newIdx = i + dir;
+    if (newIdx < 0 || newIdx >= rules.length) return;
+    const next = [...rules];
+    [next[i], next[newIdx]] = [next[newIdx], next[i]];
+    onChange({ rules: next });
+  };
+
+  return (
+    <div className="p-4 space-y-3 border-t border-neutral-200 overflow-y-auto">
+      <div className="text-xs font-semibold text-neutral-500 flex items-center gap-1.5">
+        <Users size={12} /> ROLE MAPPING
+      </div>
+      <div className="text-[11px] text-neutral-400">
+        Maps a competitor's WCIF role(s) to the "role" value used throughout the template (text, tint, background images, etc). Checked top to bottom — the first matching rule wins, since a person can hold more than one role at once (e.g. an organizer who's also judging). Anyone matching nothing below gets the fallback.
+      </div>
+
+      <div className="space-y-1.5">
+        {rules.map((rule, i) => (
+          <div key={i} className="flex items-center gap-1.5">
+            <div className="flex flex-col shrink-0">
+              <button onClick={() => moveRule(i, -1)} disabled={i === 0} className="text-neutral-400 hover:text-neutral-700 disabled:opacity-20 disabled:hover:text-neutral-400 leading-none" title="Higher priority">
+                <ChevronUp size={13} />
+              </button>
+              <button onClick={() => moveRule(i, 1)} disabled={i === rules.length - 1} className="text-neutral-400 hover:text-neutral-700 disabled:opacity-20 disabled:hover:text-neutral-400 leading-none" title="Lower priority">
+                <ChevronDown size={13} />
+              </button>
+            </div>
+            <input
+              value={rule.wcaRole}
+              onChange={(e) => updateRule(i, { wcaRole: e.target.value })}
+              placeholder="WCIF role, e.g. staff-judge"
+              className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0 font-mono"
+            />
+            <span className="text-neutral-300 text-xs">→</span>
+            <input
+              value={rule.label}
+              onChange={(e) => updateRule(i, { label: e.target.value })}
+              placeholder="role value, e.g. judge"
+              className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0"
+            />
+            <button onClick={() => removeRule(i)} className="text-neutral-400 hover:text-red-500 shrink-0">
+              <Trash2 size={12} />
+            </button>
+          </div>
+        ))}
+        {rules.length === 0 && <div className="text-xs text-neutral-400">No rules yet — everyone gets the fallback below.</div>}
+      </div>
+      <button onClick={addRule} className="flex items-center gap-1 text-xs text-blue-600 hover:underline">
+        <Plus size={11} /> Add rule
+      </button>
+
+      <div>
+        <div className="text-[11px] text-neutral-500 mb-1">Fallback (no rule matched)</div>
+        <input
+          value={roleMapping.fallback || ""}
+          onChange={(e) => onChange({ fallback: e.target.value })}
+          placeholder="competitor"
+          className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md"
+        />
+      </div>
+
+      <div className="text-[10px] text-neutral-400">
+        WCA role strings per the WCIF spec include: delegate, trainee-delegate, organizer, staff-judge, staff-scrambler, staff-runner, staff-dataentry, staff-announcer.
+      </div>
+    </div>
+  );
+}
+
+function FontsPanel({ fonts, onUpload, onRename, onRemove, onAddGooglePreset, addingGoogleFont }) {
   const onFile = (e) => {
     const file = e.target.files?.[0];
     if (file) onUpload(file);
     e.target.value = "";
   };
+  const addedPresetLabels = new Set(fonts.map((f) => f.displayName));
   return (
     <div className="p-4 space-y-3 border-t border-neutral-200 overflow-y-auto">
       <div className="text-xs font-semibold text-neutral-500 flex items-center gap-1.5">
@@ -1595,6 +2171,30 @@ function FontsPanel({ fonts, onUpload, onRename, onRemove }) {
         Upload font file
         <input type="file" accept=".ttf,.otf,.woff,.woff2" className="hidden" onChange={onFile} />
       </label>
+
+      {onAddGooglePreset && (
+        <div>
+          <div className="text-[11px] text-neutral-400 mb-1.5">Or add straight from Google Fonts — no download/upload needed:</div>
+          <div className="flex flex-wrap gap-1.5">
+            {GOOGLE_FONT_PRESETS.map((preset) => {
+              const added = addedPresetLabels.has(preset.label);
+              const loading = addingGoogleFont === preset.label;
+              return (
+                <button
+                  key={preset.label}
+                  onClick={() => onAddGooglePreset(preset)}
+                  disabled={added || loading || !!addingGoogleFont}
+                  className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 border border-neutral-300 rounded-md hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <span style={{ fontWeight: preset.weight === "700" ? 700 : 400 }}>{preset.label}</span>
+                  {added ? <span className="text-neutral-400">— added</span> : loading ? <span className="text-neutral-400">— fetching…</span> : <Plus size={11} className="text-blue-600" />}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       <div className="space-y-2">
         {fonts.map((f) => (
           <div key={f.id} className="border border-neutral-200 rounded-md p-2">
@@ -1620,7 +2220,7 @@ function FontsPanel({ fonts, onUpload, onRename, onRemove }) {
   );
 }
 
-function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth, pageHeight, onChange }) {
+function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth, pageHeight, onChange, scheduleTimezone, detectedScheduleTimezone, onScheduleTimezoneChange, onSyncCountryFlags, hasWcif }) {
   const round1 = (v) => Math.round(v * 10) / 10;
   const fieldHeightMm = () => {
     if (field.type === "schedule") {
@@ -1632,13 +2232,13 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
       const rowCount = Math.max(taskRows.length, stageRows.length);
       return (TASKKEY_HEADER_HEIGHT_PX + rowCount * TASKKEY_ROW_HEIGHT_PX) / SCALE;
     }
-    return field.h_mm || 8;
+    return fieldBoxHeightMm(field);
   };
   const centerX = () => {
     if (field.type === "text" && !field.wrap) {
       onChange({ align: "center", x_mm: round1(pageWidth / 2) });
     } else {
-      onChange({ x_mm: round1((pageWidth - (field.w_mm || 20)) / 2) });
+      onChange({ x_mm: round1((pageWidth - fieldBoxWidthMm(field)) / 2) });
     }
   };
   const centerY = () => onChange({ y_mm: round1((pageHeight - fieldHeightMm()) / 2) });
@@ -1668,11 +2268,15 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
         </button>
       </div>
 
-      {field.type !== "text" && field.type !== "schedule" && field.type !== "taskkey" && (
+      {field.type !== "text" && field.type !== "schedule" && field.type !== "taskkey" && field.type !== "qr" && (
         <div className="grid grid-cols-2 gap-2">
           <NumField label="Width (mm)" value={field.w_mm} onChange={(v) => onChange({ w_mm: v })} />
           <NumField label="Height (mm)" value={field.h_mm} onChange={(v) => onChange({ h_mm: v })} />
         </div>
+      )}
+
+      {field.type === "qr" && (
+        <NumField label="Size (mm)" value={field.size_mm} onChange={(v) => onChange({ size_mm: v })} />
       )}
 
       {(field.type === "schedule" || field.type === "taskkey") && (
@@ -1720,8 +2324,8 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
 
           {field.bindMode === "template" && (
             <div>
-              <div className="text-[11px] text-neutral-500 mb-1">Template (use {"{field}"} placeholders, Enter for a line break)</div>
-              <textarea value={field.template || ""} onChange={(e) => onChange({ template: e.target.value })} rows={2} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md resize-y font-mono" placeholder="e.g. {wcaId} - ID {registrantId}" />
+              <div className="text-[11px] text-neutral-500 mb-1">Template (use {"{field}"} placeholders, or {"{field|fallback}"} to show fallback text when a value is missing/empty. Enter for a line break)</div>
+              <textarea value={field.template || ""} onChange={(e) => onChange({ template: e.target.value })} rows={2} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md resize-y font-mono" placeholder="e.g. {wcaId|NEWCOMER} - ID {registrantId}" />
               <div className="text-[10px] text-neutral-400 mt-1">Available: {Object.keys(sampleData).map((k) => `{${k}}`).join("  ")}</div>
             </div>
           )}
@@ -1837,7 +2441,29 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
             </>
           ) : (
             <>
-              <MappingEditor mapSource={field.mapSource} mappings={field.mappings} kind="image" sampleKeys={Object.keys(sampleData)} onSourceChange={(v) => onChange({ mapSource: v })} onAdd={addMapping} onUpdate={updateMapping} onRemove={removeMapping} />
+              <MappingEditor
+                mapSource={field.mapSource}
+                mappings={field.mappings}
+                kind="image"
+                sampleKeys={Object.keys(sampleData)}
+                onSourceChange={(v) => onChange({ mapSource: v })}
+                onAdd={addMapping}
+                onUpdate={updateMapping}
+                onRemove={removeMapping}
+                onBulkFiles={(fileList) => readImageFilesAsMappingEntries(fileList).then((entries) => onChange({ mappings: upsertMappingsByValue(field.mappings, entries) }))}
+              />
+              {field.mapSource === "countryIso2" && (
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={onSyncCountryFlags}
+                    disabled={!hasWcif}
+                    className="flex items-center gap-1 text-xs text-blue-600 hover:underline disabled:text-neutral-400 disabled:no-underline disabled:cursor-not-allowed"
+                  >
+                    <Upload size={11} /> Sync flags from loaded WCIF
+                  </button>
+                  {!hasWcif && <span className="text-[10px] text-neutral-400">(load a WCIF first)</span>}
+                </div>
+              )}
               <div>
                 <div className="text-[11px] text-neutral-500 mb-1">Fallback asset path</div>
                 <input type="text" value={field.fallbackPath} onChange={(e) => onChange({ fallbackPath: e.target.value })} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md" />
@@ -1892,6 +2518,27 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
 
         return (
           <div className="space-y-3">
+            <label className="block">
+              <div className="text-[11px] text-neutral-500 mb-1">
+                Timezone <span className="text-neutral-400">(applies to every schedule field, not just this one)</span>
+              </div>
+              <input
+                type="text"
+                value={scheduleTimezone || ""}
+                onChange={(e) => onScheduleTimezoneChange(e.target.value)}
+                placeholder={detectedScheduleTimezone ? `Auto — from WCIF: ${detectedScheduleTimezone}` : "Auto (e.g. Europe/Lisbon)"}
+                className={`w-full text-xs px-2 py-1.5 border rounded-md font-mono ${scheduleTimezone && !isValidTimezone(scheduleTimezone) ? "border-red-400 bg-red-50" : "border-neutral-300"}`}
+              />
+              {scheduleTimezone && !isValidTimezone(scheduleTimezone) ? (
+                <div className="text-[10px] text-red-500 mt-1">Not a recognized IANA timezone name — times will fall back to raw UTC until this is fixed or cleared.</div>
+              ) : (
+                <div className="text-[10px] text-neutral-400 mt-1">
+                  IANA name (e.g. "Europe/Lisbon", "America/Sao_Paulo"). Leave blank to use the competition venue's own timezone
+                  {detectedScheduleTimezone ? ` (currently ${detectedScheduleTimezone})` : ""} — this follows daylight saving automatically, so it stays correct without manual adjustment.
+                </div>
+              )}
+            </label>
+
             <NumField
               label="Day Index (0 = Day 1, 1 = Day 2...)"
               value={field.dayIndex || 0}
