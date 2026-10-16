@@ -24,11 +24,14 @@ import {
   ChevronDown,
   Users,
   SwatchBook,
+  Crop,
   TriangleAlert,
 } from "lucide-react";
 import { buildCompetitorSchedules, buildGenericSchedule, buildStageList, listScheduleTexts, resolveScheduleTimezone } from "./schedule.js";
 import { generateBadgesPdf, downloadPdfBytes } from "./pdfExport.js";
 import defaultTemplate from "./defaultTemplate.json";
+import { applyTextCase, DEFAULT_FRAME, layoutTextFrame, shrinkToWidth } from "./textLayout.js";
+import { FULL_CROP, isFullCrop, normalizeCrop, placeImage } from "./imageCrop.js";
 
 const SCALE = 5.2; // px per mm
 const MIN_MM = 4;
@@ -151,11 +154,13 @@ const BUILTIN_FONTS = ["Helvetica", "Helvetica-Bold"];
 // not where the real (auto-sized) field visually was.
 function fieldBoxWidthMm(field) {
   if (field.type === "qr") return field.size_mm || 16;
+  if (field.type === "text" && field.textKind === "frame") return field.frame.w_mm;
   if (field.type === "text") return field.wrap ? field.w_mm || 60 : 0;
   return field.w_mm || 20;
 }
 function fieldBoxHeightMm(field) {
   if (field.type === "qr") return field.size_mm || 16;
+  if (field.type === "text" && field.textKind === "frame") return field.frame.auto_height ? 0 : field.frame.h_mm;
   if (field.type === "text") return 0;
   return field.h_mm || 8;
 }
@@ -435,6 +440,20 @@ function resolveTextValue(field, sampleData) {
   return (field.customPrefix || "") + value;
 }
 
+const MM_TO_PT = 72 / 25.4;
+
+// Text width in points, measured with a canvas in the font the preview
+// draws with (see textLayout.js). Measuring at "size px" gives the width at
+// "size pt" in points, since width scales linearly with font size.
+let measureCanvas = null;
+function canvasTextMeasurer(font, letterSpacing) {
+  measureCanvas ||= document.createElement("canvas").getContext("2d");
+  return (text, size) => {
+    measureCanvas.font = `${font.weight} ${size}px ${font.family}`;
+    return measureCanvas.measureText(text).width + letterSpacing * Math.max([...text].length - 1, 0);
+  };
+}
+
 function anchorTransform(align) {
   if (align === "center") return "translateX(-50%)";
   if (align === "right") return "translateX(-100%)";
@@ -482,6 +501,11 @@ function textFieldDefaults() {
     w_mm: 60,
     breakStyle: "break-all",
     lineHeight: 1.05,
+    // "point": anchored at x/y, optional wrap/auto-fit (the original mode).
+    // "frame": a box the text is laid out in (see textLayout.js).
+    textKind: "point",
+    frame: { ...DEFAULT_FRAME },
+    textCase: "none",
   };
 }
 
@@ -516,6 +540,9 @@ function inflateTextField(f) {
     size_min: f.size_min,
     size_max: f.size_max,
     max_width_mm: f.max_width_mm,
+    textKind: f.text_kind || "point",
+    frame: { ...DEFAULT_FRAME, ...(f.frame || {}) },
+    textCase: f.text_case || "none",
   };
 }
 function inflateImageField(f) {
@@ -534,6 +561,9 @@ function inflateImageField(f) {
     fallbackPath: f.fallbackPath || "assets/default.png",
     fallbackPreview: f.fallbackPreview || null,
     mappings: (f.mappings || []).map((m) => ({ value: m.value, path: m.path, preview: m.preview || null })),
+    // Part of the image to use and how it fills the box (see imageCrop.js).
+    crop: normalizeCrop(f.crop),
+    fit: f.fit || "contain",
   };
 }
 function inflateColorblockField(f) {
@@ -1000,7 +1030,11 @@ export default function BadgeDesigner() {
       applyFieldPatch(d.id, { x_mm: round1(nx), y_mm: round1(ny) });
     } else {
       const nw = clamp(d.origW + dx, MIN_MM, pw - d.origX);
-      if (d.type === "schedule" || d.type === "taskkey") {
+      const dragged = sd.fields.find((f) => f.id === d.id);
+      if (dragged?.type === "text" && dragged.textKind === "frame") {
+        const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
+        applyFieldPatch(d.id, { frame: { ...dragged.frame, w_mm: round1(nw), ...(dragged.frame.auto_height ? {} : { h_mm: round1(nh) }) } });
+      } else if (d.type === "schedule" || d.type === "taskkey") {
         // Height is derived, not draggable — width only.
         applyFieldPatch(d.id, { w_mm: round1(nw) });
       } else if (d.type === "qr") {
@@ -1120,10 +1154,15 @@ export default function BadgeDesigner() {
           }
           Object.assign(out, { font: f.font, color: f.color, align: f.align || "left", letter_spacing: f.letterSpacing || 0, wrap: !!f.wrap });
           if (f.wrap) Object.assign(out, { w_mm: f.w_mm, break_style: f.breakStyle, line_height: f.lineHeight || 1.05 });
-          if (f.fontMode === "autofit") Object.assign(out, { size_min: f.size_min, size_max: f.size_max, max_width_mm: f.max_width_mm || 60 });
+          if (f.textCase && f.textCase !== "none") out.text_case = f.textCase;
+          if (f.textKind === "frame") {
+            Object.assign(out, { text_kind: "frame", frame: f.frame, size: f.size, line_height: f.lineHeight || 1.05, break_style: f.breakStyle });
+          } else if (f.fontMode === "autofit") Object.assign(out, { size_min: f.size_min, size_max: f.size_max, max_width_mm: f.max_width_mm || 60 });
           else out.size = f.size;
         } else if (f.type === "image") {
           Object.assign(out, { w_mm: f.w_mm, h_mm: f.h_mm, mapped: f.mapped });
+          if (!isFullCrop(f.crop)) out.crop = f.crop;
+          if (f.fit && f.fit !== "contain") out.fit = f.fit;
           if (f.mapped) {
             Object.assign(out, {
               mapSource: f.mapSource,
@@ -1611,14 +1650,34 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
     taskKeyHeightPx = TASKKEY_HEADER_HEIGHT_PX + rowCount * TASKKEY_ROW_HEIGHT_PX;
   }
 
-  const h = field.type === "schedule" ? scheduleHeightPx : field.type === "taskkey" ? taskKeyHeightPx : fieldBoxHeightMm(field) * scale;
+  // Text: points -> preview px (1 pt = 25.4/72 mm, at `scale` px per mm),
+  // measured with the same font the preview draws in, so a text frame
+  // breaks lines exactly where textLayout.js will in the PDF.
+  const ptPx = (scale * 25.4) / 72;
+  const isTextFrame = field.type === "text" && field.textKind === "frame";
+  let textFont = null;
+  let textValue = null;
+  let measureText = null;
+  let frameLayout = null;
+  if (field.type === "text") {
+    const isCustom = !BUILTIN_FONTS.includes(field.font);
+    textFont = { family: isCustom ? `"${field.font}", sans-serif` : "Helvetica, Arial, sans-serif", weight: field.font === "Helvetica-Bold" ? 700 : 400 };
+    textValue = applyTextCase(resolveTextValue(field, sampleData), field.textCase);
+    measureText = canvasTextMeasurer(textFont, field.letterSpacing || 0);
+    if (isTextFrame) {
+      frameLayout = layoutTextFrame(textValue, field.frame, { measure: measureText, lineHeight: field.lineHeight || 1.05, breakStyle: field.breakStyle || "break-word", fixedSize: field.size || 12 });
+    }
+  }
+
+  let h = field.type === "schedule" ? scheduleHeightPx : field.type === "taskkey" ? taskKeyHeightPx : fieldBoxHeightMm(field) * scale;
+  if (isTextFrame && field.frame.auto_height) h = (frameLayout.blockHeight + 2 * frameLayout.padding) * ptPx;
 
   const style = {
     position: "absolute",
     left: field.x_mm * scale,
     top: field.y_mm * scale,
-    width: field.type === "text" ? (textWraps ? w : "auto") : w,
-    height: field.type === "text" ? "auto" : h,
+    width: field.type === "text" && !isTextFrame ? (textWraps ? w : "auto") : w,
+    height: field.type === "text" && !isTextFrame ? "auto" : h,
     outline: selected ? "1.5px solid #2563eb" : outsideMargin ? "1.5px dashed #f59e0b" : "1px dashed rgba(0,0,0,0.25)",
     cursor: "move",
     userSelect: "none",
@@ -1627,22 +1686,53 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
   };
 
   let content;
-  if (field.type === "text") {
-    const isBuiltinBold = field.font === "Helvetica-Bold";
-    const isCustom = !BUILTIN_FONTS.includes(field.font);
-    const fontFamily = isCustom ? `"${field.font}", sans-serif` : "Helvetica, Arial, sans-serif";
-    const fontWeight = isBuiltinBold ? 700 : 400;
-    const fontSize = field.fontMode === "autofit" ? field.size_max : field.size;
-    const value = resolveTextValue(field, sampleData);
+  if (field.type === "text" && isTextFrame) {
+    const { lines, size, lineHeight, offsetY, padding, innerW, overflow } = frameLayout;
+    content = (
+      <>
+        {lines.map((line, i) => (
+          <div
+            key={i}
+            style={{
+              position: "absolute",
+              left: padding * ptPx,
+              top: (padding + offsetY + i * lineHeight) * ptPx,
+              width: innerW * ptPx,
+              height: lineHeight * ptPx,
+              fontSize: size * ptPx,
+              lineHeight: `${lineHeight * ptPx}px`,
+              fontWeight: textFont.weight,
+              fontFamily: textFont.family,
+              color: field.color,
+              letterSpacing: `${(field.letterSpacing || 0) * ptPx}px`,
+              whiteSpace: "pre",
+              textAlign: align,
+            }}
+          >
+            {line}
+          </div>
+        ))}
+        {overflow && (
+          // Like Affinity's overflow marker: the text doesn't fit the frame
+          // even at its smallest size. Editor-only, never printed.
+          <div title="Text doesn't fit this frame" style={{ position: "absolute", right: -5, bottom: -5, width: 10, height: 10, background: "#dc2626", border: "1.5px solid #fff", borderRadius: 2 }} />
+        )}
+      </>
+    );
+  } else if (field.type === "text") {
+    const fontSize =
+      field.fontMode === "autofit"
+        ? shrinkToWidth(textValue, { min: field.size_min || 8, max: field.size_max || 16, maxWidth: (field.max_width_mm || 60) * MM_TO_PT, measure: measureText })
+        : field.size;
     content = (
       <div
         style={{
-          fontSize: fontSize * (scale / 2.6),
-          fontWeight,
-          fontFamily,
+          fontSize: fontSize * ptPx,
+          fontWeight: textFont.weight,
+          fontFamily: textFont.family,
           color: field.color,
           lineHeight: field.lineHeight || 1.05,
-          letterSpacing: `${(field.letterSpacing || 0) * (scale / 2.6)}px`,
+          letterSpacing: `${(field.letterSpacing || 0) * ptPx}px`,
           whiteSpace: textWraps ? "pre-wrap" : "pre-line",
           wordBreak: textWraps ? field.breakStyle || "break-word" : undefined,
           overflowWrap: textWraps ? "anywhere" : undefined,
@@ -1652,7 +1742,7 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
           display: textWraps ? undefined : "inline-block",
         }}
       >
-        {value}
+        {textValue}
       </div>
     );
   } else if (field.type === "image") {
@@ -1663,7 +1753,7 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
       src = m ? m.preview : field.fallbackPreview;
       label = m ? m.path?.split("/").pop() : field.fallbackPath?.split("/").pop() || "no match";
     }
-    content = src ? <img src={src} alt="" className="w-full h-full object-contain" /> : <div className="w-full h-full flex items-center justify-center bg-neutral-200/70 text-[9px] text-neutral-500 rounded text-center px-1">{label}</div>;
+    content = src ? <CroppedImage src={src} crop={field.crop} fit={field.fit || "contain"} boxW={w} boxH={h} /> : <div className="w-full h-full flex items-center justify-center bg-neutral-200/70 text-[9px] text-neutral-500 rounded text-center px-1">{label}</div>;
   } else if (field.type === "colorblock") {
     const color = resolveMapping(field, sampleData, "color");
     const label = field.labelSource ? sampleData[field.labelSource] : null;
@@ -1890,12 +1980,12 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
   }
 
   return (
-    <div style={style} data-field-id={field.id} data-field-type={field.type} onPointerDown={onPointerDownMove}>
+    <div style={style} data-field-id={field.id} data-field-type={isTextFrame ? "textframe" : field.type} onPointerDown={onPointerDownMove}>
       {content}
-      {selected && (field.type !== "text" || textWraps) && (
+      {selected && (field.type !== "text" || textWraps || isTextFrame) && (
         <div
           onPointerDown={onPointerDownResize}
-          style={{ position: "absolute", right: -4, bottom: -4, width: 10, height: 10, background: "#2563eb", borderRadius: 2, cursor: field.type === "schedule" || field.type === "taskkey" ? "ew-resize" : "nwse-resize" }}
+          style={{ position: "absolute", right: -4, bottom: -4, width: 10, height: 10, background: "#2563eb", borderRadius: 2, cursor: field.type === "schedule" || field.type === "taskkey" || (isTextFrame && field.frame.auto_height) ? "ew-resize" : "nwse-resize" }}
         />
       )}
     </div>
@@ -2520,51 +2610,101 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
             </>
           )}
 
+          <div className="grid grid-cols-2 gap-1 p-0.5 bg-neutral-100 rounded-md text-xs">
+            {[["point", "Point text"], ["frame", "Text frame"]].map(([kind, label]) => (
+              <button
+                key={kind}
+                onClick={() => {
+                  if ((field.textKind || "point") === kind) return;
+                  // Unwrapped point text's X is its anchor (left edge /
+                  // center / right edge, per alignment); a frame's X is its
+                  // left edge, so shift to keep the text where it was.
+                  // Wrapped point text is already a box from X: keep X and
+                  // carry its width over.
+                  const frame = { ...DEFAULT_FRAME, ...(field.frame || {}), ...(field.wrap && kind === "frame" ? { w_mm: field.w_mm } : {}) };
+                  const anchor = field.wrap ? 0 : field.align === "center" ? frame.w_mm / 2 : field.align === "right" ? frame.w_mm : 0;
+                  const x_mm = Math.round((kind === "frame" ? field.x_mm - anchor : field.x_mm + anchor) * 10) / 10;
+                  onChange({ textKind: kind, frame, x_mm });
+                }}
+                className={`py-1 rounded ${(field.textKind || "point") === kind ? "bg-white shadow-sm font-medium text-neutral-900" : "text-neutral-500"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="text-[10px] text-neutral-400 -mt-1">
+            {field.textKind === "frame"
+              ? "The text is laid out inside a box: it shrinks, wraps and aligns within it. Drag the corner handle to resize."
+              : "Anchored at one point; it grows from there."}
+          </div>
+
           <AlignField value={field.align} onChange={(v) => onChange({ align: v })} />
-
-          <div className="border-t border-neutral-100 pt-3">
-            <label className="flex items-center gap-1.5 text-xs text-neutral-600">
-              <input type="checkbox" checked={field.wrap} onChange={(e) => onChange({ wrap: e.target.checked })} />
-              Wrap to a fixed width (multi-line)
-            </label>
-            {field.wrap && (
-              <div className="mt-2 space-y-2">
-                <NumField label="Width (mm)" value={field.w_mm} onChange={(v) => onChange({ w_mm: v })} />
-                <SelectField label="Break style" value={field.breakStyle || "break-word"} onChange={(v) => onChange({ breakStyle: v })} options={["break-word", "break-all"]} />
-                <div className="text-[10px] text-neutral-400">"break-all" splits mid-word (e.g. COMPE / TITOR); "break-word" only breaks at spaces when possible.</div>
-                <NumField label="Line height" value={field.lineHeight || 1.05} onChange={(v) => onChange({ lineHeight: v })} />
-              </div>
-            )}
-            {!field.wrap && <div className="text-[10px] text-neutral-400 mt-1.5">Without wrap, alignment treats X as the anchor point (left edge / center / right edge of the text).</div>}
-          </div>
-
-          <div>
-            <div className="text-[11px] text-neutral-500 mb-1">Font</div>
-            <select value={field.font} onChange={(e) => onChange({ font: e.target.value })} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md">
-              {fontOptions.map((f) => (
-                <option key={f} value={f}>
-                  {fontLabel(f)}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex items-center gap-3 text-xs">
-            <label className="flex items-center gap-1.5">
-              <input type="radio" checked={field.fontMode === "fixed"} onChange={() => onChange({ fontMode: "fixed" })} />
-              Fixed size
-            </label>
-            <label className="flex items-center gap-1.5">
-              <input type="radio" checked={field.fontMode === "autofit"} onChange={() => onChange({ fontMode: "autofit" })} />
-              Auto-fit
-            </label>
-          </div>
-          {field.fontMode === "fixed" ? (
-            <NumField label="Size (pt)" value={field.size} onChange={(v) => onChange({ size: v })} />
+          <SelectField label="Case" value={field.textCase || "none"} onChange={(v) => onChange({ textCase: v })} options={["none", "upper", "lower", "title"]} />
+          {field.textKind === "frame" ? (
+            <TextFrameOptions
+              field={field}
+              onChange={onChange}
+              fontSelect={
+                <div>
+                  <div className="text-[11px] text-neutral-500 mb-1">Font</div>
+                  <select value={field.font} onChange={(e) => onChange({ font: e.target.value })} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md">
+                    {fontOptions.map((f) => (
+                      <option key={f} value={f}>
+                        {fontLabel(f)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              }
+            />
           ) : (
-            <div className="grid grid-cols-2 gap-2">
-              <NumField label="Min pt" value={field.size_min || 8} onChange={(v) => onChange({ size_min: v })} />
-              <NumField label="Max pt" value={field.size_max || 16} onChange={(v) => onChange({ size_max: v })} />
-            </div>
+            <>
+              <div className="border-t border-neutral-100 pt-3">
+                <label className="flex items-center gap-1.5 text-xs text-neutral-600">
+                  <input type="checkbox" checked={field.wrap} onChange={(e) => onChange({ wrap: e.target.checked })} />
+                  Wrap to a fixed width (multi-line)
+                </label>
+                {field.wrap && (
+                  <div className="mt-2 space-y-2">
+                    <NumField label="Width (mm)" value={field.w_mm} onChange={(v) => onChange({ w_mm: v })} />
+                    <SelectField label="Break style" value={field.breakStyle || "break-word"} onChange={(v) => onChange({ breakStyle: v })} options={["break-word", "break-all"]} />
+                    <div className="text-[10px] text-neutral-400">"break-all" splits mid-word (e.g. COMPE / TITOR); "break-word" only breaks at spaces when possible.</div>
+                    <NumField label="Line height" value={field.lineHeight || 1.05} onChange={(v) => onChange({ lineHeight: v })} />
+                  </div>
+                )}
+                {!field.wrap && <div className="text-[10px] text-neutral-400 mt-1.5">Without wrap, alignment treats X as the anchor point (left edge / center / right edge of the text).</div>}
+              </div>
+
+              <div>
+                <div className="text-[11px] text-neutral-500 mb-1">Font</div>
+                <select value={field.font} onChange={(e) => onChange({ font: e.target.value })} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md">
+                  {fontOptions.map((f) => (
+                    <option key={f} value={f}>
+                      {fontLabel(f)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-3 text-xs">
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={field.fontMode === "fixed"} onChange={() => onChange({ fontMode: "fixed" })} />
+                  Fixed size
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={field.fontMode === "autofit"} onChange={() => onChange({ fontMode: "autofit" })} />
+                  Auto-fit
+                </label>
+              </div>
+              {field.fontMode === "fixed" ? (
+                <NumField label="Size (pt)" value={field.size} onChange={(v) => onChange({ size: v })} />
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  <NumField label="Min pt" value={field.size_min || 8} onChange={(v) => onChange({ size_min: v })} />
+                  <NumField label="Max pt" value={field.size_max || 16} onChange={(v) => onChange({ size_max: v })} />
+                  <NumField label="Max width (mm)" value={field.max_width_mm || 60} onChange={(v) => onChange({ max_width_mm: v })} />
+                </div>
+              )}
+            </>
           )}
           <NumField label="Letter spacing (pt)" value={field.letterSpacing || 0} onChange={(v) => onChange({ letterSpacing: v })} />
           <ColorField label="Color" value={field.color} onChange={(v) => onChange({ color: v })} />
@@ -2631,6 +2771,7 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
               </div>
             </>
           )}
+          <ImageCropControls field={field} sampleData={sampleData} onChange={onChange} />
         </>
       )}
 
@@ -2864,6 +3005,271 @@ function SelectField({ label, value, onChange, options }) {
         ))}
       </select>
     </label>
+  );
+}
+
+// Text frame settings (see textLayout.js for what each one does).
+function TextFrameOptions({ field, onChange, fontSelect }) {
+  const frame = field.frame;
+  const set = (patch) => onChange({ frame: { ...frame, ...patch } });
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-2">
+        <NumField label="Width (mm)" value={frame.w_mm} onChange={(v) => set({ w_mm: v })} />
+        {!frame.auto_height && <NumField label="Height (mm)" value={frame.h_mm} onChange={(v) => set({ h_mm: v })} />}
+      </div>
+      <label className="flex items-center gap-1.5 text-xs text-neutral-600">
+        <input type="checkbox" checked={!!frame.auto_height} onChange={(e) => set({ auto_height: e.target.checked })} />
+        Auto height (the frame grows with its text)
+      </label>
+      <div className="grid grid-cols-2 gap-2">
+        <NumField label="Inset (mm)" value={frame.padding_mm || 0} onChange={(v) => set({ padding_mm: Math.max(0, v) })} />
+        {!frame.auto_height && <SelectField label="Vertical align" value={frame.v_align} onChange={(v) => set({ v_align: v })} options={["top", "middle", "bottom"]} />}
+      </div>
+
+      {fontSelect}
+
+      <div className="flex items-center gap-3 text-xs">
+        <label className="flex items-center gap-1.5">
+          <input type="radio" checked={frame.fit === "fixed"} onChange={() => set({ fit: "fixed" })} />
+          Fixed size
+        </label>
+        <label className="flex items-center gap-1.5">
+          <input type="radio" checked={frame.fit !== "fixed"} onChange={() => set({ fit: "shrink" })} />
+          Shrink to fit
+        </label>
+      </div>
+      {frame.fit === "fixed" ? (
+        <NumField label="Size (pt)" value={field.size} onChange={(v) => onChange({ size: v })} />
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-2">
+            <NumField label="Min pt" value={frame.size_min} onChange={(v) => set({ size_min: v })} />
+            <NumField label="Max pt" value={frame.size_max} onChange={(v) => set({ size_max: v })} />
+          </div>
+          <NumField label="Break into lines below (pt)" value={frame.wrap_below || 0} onChange={(v) => set({ wrap_below: Math.max(0, v) })} />
+          <div className="text-[10px] text-neutral-400 -mt-2">
+            Keeps the text on one line while it fits at this size or bigger; below it, the text breaks into lines instead (and can grow back up). 0 = stay on one line down to the minimum.
+          </div>
+        </>
+      )}
+      <div className="grid grid-cols-2 gap-2">
+        <NumField label="Max lines (0 = any)" value={frame.max_lines || 0} onChange={(v) => set({ max_lines: Math.max(0, Math.round(v)) })} />
+        <NumField label="Line height" value={field.lineHeight || 1.05} onChange={(v) => onChange({ lineHeight: v })} />
+      </div>
+      <SelectField label="Break style" value={field.breakStyle || "break-word"} onChange={(v) => onChange({ breakStyle: v })} options={["break-word", "break-all"]} />
+      <SelectField label="If it still doesn't fit" value={frame.overflow} onChange={(v) => set({ overflow: v })} options={["visible", "clip", "ellipsis"]} />
+      <div className="text-[10px] text-neutral-400 -mt-2">"clip" drops the lines that fall outside the frame; "ellipsis" also ends the last one with "…". A red marker on the frame means its text doesn't fit.</div>
+    </div>
+  );
+}
+
+// An image drawn the way placeImage (imageCrop.js) says — the same math
+// pdfExport.js uses, so the preview shows exactly what gets printed.
+function CroppedImage({ src, crop, fit, boxW, boxH }) {
+  const [natural, setNatural] = useState(null);
+  const ready = natural && natural.src === src;
+  const p = ready ? placeImage(natural.w, natural.h, crop, fit, boxW, boxH) : null;
+  const sx = p ? p.dw / p.sw : 0;
+  const sy = p ? p.dh / p.sh : 0;
+  return (
+    <div style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden" }}>
+      {/* The drawn area is p.dx..p.dx+p.dw; clipping to it keeps the rest of the image hidden. */}
+      <div style={{ position: "absolute", left: p ? p.dx : 0, top: p ? p.dy : 0, width: p ? p.dw : "100%", height: p ? p.dh : "100%", overflow: "hidden" }}>
+        <img
+          src={src}
+          alt=""
+          draggable={false}
+          onLoad={(e) => setNatural({ src, w: e.currentTarget.naturalWidth || 512, h: e.currentTarget.naturalHeight || 512 })}
+          style={
+            p
+              ? { position: "absolute", maxWidth: "none", left: -p.sx * sx, top: -p.sy * sy, width: natural.w * sx, height: natural.h * sy }
+              : { width: "100%", height: "100%", objectFit: "contain", opacity: 0 }
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
+// Fit mode + crop button for an image field. Mapped images share one crop
+// (it's in fractions of the image, so it applies to each of them); the
+// editor shows whichever image the sample data currently picks.
+function ImageCropControls({ field, sampleData, onChange }) {
+  const [editing, setEditing] = useState(false);
+  const src = field.mapped ? resolveMapping(field, sampleData, "image")?.preview || field.fallbackPreview : field.preview;
+  return (
+    <div className="border-t border-neutral-100 pt-3 space-y-2">
+      <div className="text-[11px] text-neutral-500">Fit in box</div>
+      <div className="grid grid-cols-3 gap-1 p-0.5 bg-neutral-100 rounded-md text-xs">
+        {[["contain", "Fit"], ["cover", "Fill"], ["stretch", "Stretch"]].map(([fit, label]) => (
+          <button key={fit} onClick={() => onChange({ fit })} className={`py-1 rounded ${(field.fit || "contain") === fit ? "bg-white shadow-sm font-medium text-neutral-900" : "text-neutral-500"}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+      <div className="text-[10px] text-neutral-400">Fit shows the whole (cropped) image; Fill covers the box and trims what doesn't match its shape; Stretch distorts it to the box.</div>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={() => setEditing(true)}
+          disabled={!src}
+          className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 border border-neutral-300 rounded-md hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <Crop size={12} /> Crop…
+        </button>
+        {!isFullCrop(field.crop) && (
+          <button onClick={() => onChange({ crop: { ...FULL_CROP } })} className="text-xs text-blue-600 hover:underline">
+            Reset crop
+          </button>
+        )}
+        {!src && <span className="text-[10px] text-neutral-400">Add a preview image first</span>}
+      </div>
+      {editing && src && <CropEditor src={src} crop={field.crop} frameAspect={field.w_mm / field.h_mm} onChange={(crop) => onChange({ crop })} onClose={() => setEditing(false)} />}
+    </div>
+  );
+}
+
+// Modal crop editor: drag the rectangle to move it, its corners to resize
+// it. Changes apply live; "Match box shape" keeps the rectangle in the
+// field's proportions, so Fit and Fill both show exactly the selected area.
+function CropEditor({ src, crop, frameAspect, onChange, onClose }) {
+  const [natural, setNatural] = useState(null);
+  const [lockAspect, setLockAspect] = useState(false);
+  const dragRef = useRef(null);
+  const c = normalizeCrop(crop);
+
+  const MAX_W = 560;
+  const MAX_H = 420;
+  const scale = natural ? Math.min(MAX_W / natural.w, MAX_H / natural.h) : 1;
+  const dispW = natural ? natural.w * scale : MAX_W;
+  const dispH = natural ? natural.h * scale : MAX_H;
+  // Height (as a fraction of the image) that gives a crop of width-fraction
+  // w the box's proportions.
+  const lockedH = (w) => (w * dispW) / (dispH * frameAspect);
+
+  const startDrag = (e, mode) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragRef.current = { mode, startX: e.clientX, startY: e.clientY, orig: c };
+    const move = (ev) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const dx = (ev.clientX - d.startX) / dispW;
+      const dy = (ev.clientY - d.startY) / dispH;
+      const o = d.orig;
+      if (d.mode === "move") {
+        onChange(normalizeCrop({ ...o, x: Math.min(Math.max(o.x + dx, 0), 1 - o.w), y: Math.min(Math.max(o.y + dy, 0), 1 - o.h) }));
+        return;
+      }
+      // Corner resize: the opposite corner stays put.
+      const left = d.mode.includes("w");
+      const top = d.mode.includes("n");
+      const right = o.x + o.w;
+      const bottom = o.y + o.h;
+      let x1 = left ? Math.min(Math.max(o.x + dx, 0), right - 0.02) : o.x;
+      let x2 = left ? right : Math.min(Math.max(right + dx, o.x + 0.02), 1);
+      let y1 = top ? Math.min(Math.max(o.y + dy, 0), bottom - 0.02) : o.y;
+      let y2 = top ? bottom : Math.min(Math.max(bottom + dy, o.y + 0.02), 1);
+      if (lockAspect) {
+        let w = x2 - x1;
+        let h = lockedH(w);
+        const maxH = top ? bottom : 1 - o.y;
+        if (h > maxH) {
+          h = maxH;
+          w = (h * dispH * frameAspect) / dispW;
+          if (left) x1 = x2 - w;
+          else x2 = x1 + w;
+        }
+        if (top) y1 = bottom - h;
+        else y2 = y1 + h;
+      }
+      onChange(normalizeCrop({ x: x1, y: y1, w: x2 - x1, h: y2 - y1 }));
+    };
+    const up = () => {
+      dragRef.current = null;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  const toggleLock = (on) => {
+    setLockAspect(on);
+    if (!on) return;
+    // Snap the current rectangle to the box's proportions, keeping its center.
+    let w = c.w;
+    let h = lockedH(w);
+    if (h > 1) {
+      h = 1;
+      w = (h * dispH * frameAspect) / dispW;
+    }
+    const cx = c.x + c.w / 2;
+    const cy = c.y + c.h / 2;
+    onChange(normalizeCrop({ x: Math.min(Math.max(cx - w / 2, 0), 1 - w), y: Math.min(Math.max(cy - h / 2, 0), 1 - h), w, h }));
+  };
+
+  const handle = (mode, style) => (
+    <div onPointerDown={(e) => startDrag(e, mode)} style={{ position: "absolute", width: 14, height: 14, background: "#fff", border: "2px solid #2563eb", borderRadius: 3, ...style }} />
+  );
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onPointerDown={onClose}>
+      <div className="bg-white rounded-lg shadow-xl p-4 space-y-3 max-w-full" onPointerDown={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-semibold flex items-center gap-1.5">
+            <Crop size={14} /> Crop image
+          </div>
+          <button onClick={onClose} className="text-neutral-400 hover:text-neutral-700">
+            <X size={16} />
+          </button>
+        </div>
+        <div style={{ position: "relative", width: dispW, height: dispH, overflow: "hidden", userSelect: "none", background: "repeating-conic-gradient(#e5e5e5 0% 25%, #fff 0% 50%) 50% / 16px 16px" }}>
+          <img
+            src={src}
+            alt=""
+            draggable={false}
+            onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth || 512, h: e.currentTarget.naturalHeight || 512 })}
+            style={{ width: dispW, height: dispH, display: "block" }}
+          />
+          {natural && (
+            <div
+              data-crop-rect
+              onPointerDown={(e) => startDrag(e, "move")}
+              style={{
+                position: "absolute",
+                left: c.x * dispW,
+                top: c.y * dispH,
+                width: c.w * dispW,
+                height: c.h * dispH,
+                boxShadow: "0 0 0 9999px rgba(0,0,0,0.55)",
+                outline: "1.5px solid #fff",
+                cursor: "move",
+              }}
+            >
+              {handle("nw", { left: -7, top: -7, cursor: "nwse-resize" })}
+              {handle("ne", { right: -7, top: -7, cursor: "nesw-resize" })}
+              {handle("sw", { left: -7, bottom: -7, cursor: "nesw-resize" })}
+              {handle("se", { right: -7, bottom: -7, cursor: "nwse-resize" })}
+            </div>
+          )}
+        </div>
+        <div className="flex items-center justify-between gap-4">
+          <label className="flex items-center gap-1.5 text-xs text-neutral-600">
+            <input type="checkbox" checked={lockAspect} onChange={(e) => toggleLock(e.target.checked)} />
+            Match box shape
+          </label>
+          <div className="flex items-center gap-2">
+            <button onClick={() => onChange({ ...FULL_CROP })} className="text-xs px-3 py-1.5 border border-neutral-300 rounded-md hover:bg-neutral-50">
+              Reset
+            </button>
+            <button onClick={onClose} className="text-xs px-3 py-1.5 bg-neutral-900 text-white rounded-md hover:bg-neutral-800">
+              Done
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

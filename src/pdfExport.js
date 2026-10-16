@@ -2,6 +2,8 @@ import { PDFDocument, rgb, StandardFonts, pushGraphicsState, popGraphicsState, c
 import fontkit from "@pdf-lib/fontkit";
 import QRCode from "qrcode";
 import { buildCompetitorSchedules, buildStageList } from "./schedule.js";
+import { applyTextCase, layoutTextFrame } from "./textLayout.js";
+import { isFullCrop, placeImage } from "./imageCrop.js";
 
 const MM_TO_PT = 2.834645669;
 const mmv = (v) => v * MM_TO_PT;
@@ -350,13 +352,31 @@ function wrapLines(fonts, preferredFont, text, size, maxWidthPt, breakStyle) {
 // applied — every draw*Field function below just draws at a plain anchor
 // and never touches field.rotate itself).
 function drawTextField(page, field, ctx, fonts, originX, originY) {
-  const value = resolveTextValue(field, ctx);
+  const value = applyTextCase(resolveTextValue(field, ctx), field.textCase);
   const isBold = (field.font || "").includes("Bold");
   const isCustom = fonts.custom[field.font];
   const preferredFont = isCustom || (isBold ? fonts.helveticaBold : fonts.helvetica);
   const color = hexToRgb01(field.color || "#000000");
   const align = field.align || "left";
   const letterSpacing = field.letterSpacing || field.letter_spacing || 0;
+
+  if (field.textKind === "frame") {
+    // Text frame: the shared layout engine (textLayout.js) picks the size
+    // and line breaks; lines are aligned inside the frame's inner box.
+    const measure = (s, size) => planWidth(buildCharPlan(fonts, preferredFont, s, size), letterSpacing);
+    const layout = layoutTextFrame(value, field.frame, { measure, lineHeight: field.lineHeight || 1.05, breakStyle: field.breakStyle || "break-word", fixedSize: field.size || 12 });
+    layout.lines.forEach((line, i) => {
+      const plan = buildCharPlan(fonts, preferredFont, line, layout.size);
+      const textW = planWidth(plan, letterSpacing);
+      let offset = 0;
+      if (align === "center") offset = (layout.innerW - textW) / 2;
+      else if (align === "right") offset = layout.innerW - textW;
+      const lineTopY = originY - layout.padding - layout.offsetY - i * layout.lineHeight;
+      drawCharPlan(page, plan, originX + layout.padding + offset, lineTopY - layout.size * 0.75, layout.size, letterSpacing, color);
+    });
+    return;
+  }
+
   const isWrap = !!field.wrap;
   const boxW = isWrap ? mmv(field.w_mm || 60) : null;
 
@@ -415,32 +435,44 @@ async function drawImageField(page, field, ctx, pdfDoc, imageCache, originX, ori
 
   const boxW = mmv(field.w_mm);
   const boxH = mmv(field.h_mm);
+  const fit = field.fit || "contain";
 
-  const embedded = await embedImageCached(pdfDoc, src, imageCache, { width: boxW, height: boxH });
+  // Cropped (or filled, which trims to the box's shape): cut the needed
+  // part out of the source first, then draw that. Plain "fit the whole
+  // image" keeps embedding the original as-is.
+  let drawSrc = src;
+  let place = null;
+  if (!isFullCrop(field.crop) || fit !== "contain") {
+    const img = await loadImageEl(src);
+    const imgW = img.naturalWidth || 512;
+    const imgH = img.naturalHeight || 512;
+    place = placeImage(imgW, imgH, field.crop, fit, boxW, boxH);
+    drawSrc = await cropImageCached(img, src, place, imageCache);
+  }
+
+  const embedded = await embedImageCached(pdfDoc, drawSrc, imageCache, { width: boxW, height: boxH });
   if (!embedded) return;
 
-  // Match the designer canvas's `object-contain` rendering (see FieldBox's
-  // "w-full h-full object-contain" for image fields): scale the image to
-  // fit inside the field's box while preserving its own aspect ratio, then
-  // center it in the box. Drawing at boxW x boxH directly (the old
-  // behavior) stretches the image to the box's aspect ratio instead of the
-  // image's own, which is what made an image with an aspect ratio different
-  // from its field come out squashed/stretched compared to the template.
-  const imgAspect = embedded.width / embedded.height;
-  const boxAspect = boxW / boxH;
-  let w = boxW;
-  let h = boxH;
-  if (imgAspect > boxAspect) {
-    w = boxW;
-    h = boxW / imgAspect;
-  } else {
-    h = boxH;
-    w = boxH * imgAspect;
-  }
-  const x = originX + (boxW - w) / 2;
-  const y = originY - boxH + (boxH - h) / 2;
+  // Same placement as the designer canvas (see placeImage in imageCrop.js):
+  // with no crop and "contain", the whole image scaled to fit and centered.
+  if (!place) place = placeImage(embedded.width, embedded.height, null, fit, boxW, boxH);
+  page.drawImage(embedded, { x: originX + place.dx, y: originY - place.dy - place.dh, width: place.dw, height: place.dh });
+}
 
-  page.drawImage(embedded, { x, y, width: w, height: h });
+// Cuts place's source rectangle out of an image into a new data URL, at the
+// source's own resolution (vector sources: at print resolution for the size
+// they're drawn at). JPEG sources stay JPEG to keep file size down.
+async function cropImageCached(img, src, place, cache) {
+  const key = `crop::${src}::${[place.sx, place.sy, place.sw, place.sh, place.dw, place.dh].map((v) => v.toFixed(2)).join(",")}`;
+  if (cache.has(key)) return cache.get(key);
+  const isSvg = src.startsWith("data:image/svg+xml");
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(isSvg ? ptToRasterPx(place.dw) : place.sw));
+  canvas.height = Math.max(1, Math.round(isSvg ? ptToRasterPx(place.dh) : place.sh));
+  canvas.getContext("2d").drawImage(img, place.sx, place.sy, place.sw, place.sh, 0, 0, canvas.width, canvas.height);
+  const out = src.startsWith("data:image/jpeg") ? canvas.toDataURL("image/jpeg", 0.92) : canvas.toDataURL("image/png");
+  cache.set(key, out);
+  return out;
 }
 
 // PDF points -> raster pixels at a print-quality DPI. A vector source
