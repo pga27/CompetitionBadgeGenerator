@@ -151,11 +151,16 @@ function eventNameOf(activityName) {
  * Every text the schedule table derives from the WCIF that the user can
  * rename (see the Schedule panel in BadgeDesigner.jsx): one entry per event
  * (overriding the event part of all its rows, e.g. "3x3 OH" -> "OH") and one
- * per distinct non-event activity name (e.g. "Lunch" -> "Comida").
+ * per distinct non-event activity name (e.g. "Lunch" -> "Comida"). Also
+ * lists the later rounds (round 2+ of multi-round events) whose groups can
+ * be merged into one row (see mergedRounds in buildBaseSchedule), with how
+ * many groups each has.
  */
 export function listScheduleTexts(wcif) {
   const events = new Map();
+  const eventNames = {};
   const activities = new Map();
+  const groupsByRound = {};
   for (const venue of wcif?.schedule?.venues || []) {
     for (const room of venue.rooms || []) {
       for (const act of room.activities || []) {
@@ -167,13 +172,28 @@ export function listScheduleTexts(wcif) {
             if (!activities.has(a.name)) activities.set(a.name, { name: a.name, defaultText: defaultActivityLabel(a.name, code) });
           } else if (eventId && !events.has(eventId)) {
             const eventName = eventNameOf(a.name);
+            eventNames[eventId] = eventName;
             events.set(eventId, { id: eventId, defaultText: ABV[eventName] || eventName });
           }
+          const group = /^([^-]+-r\d+)-g\d+/.exec(code);
+          if (group) (groupsByRound[group[1]] ||= new Set()).add(code.replace(/-a\d+$/, ""));
         }
       }
     }
   }
-  return { events: [...events.values()], activities: [...activities.values()] };
+
+  const laterRounds = [];
+  for (const event of wcif?.events || []) {
+    const rounds = event.rounds || [];
+    const eventName = eventNames[event.id] || event.id;
+    rounds.slice(1).forEach((round, i) => {
+      const roundNum = i + 2;
+      const label = `${SUBSEQUENT_ROUND_NAMES[eventName] || eventName} ${roundNum === rounds.length ? "Final" : `R${roundNum}`}`;
+      laterRounds.push({ code: round.id, label, groups: groupsByRound[round.id]?.size || 0 });
+    });
+  }
+
+  return { events: [...events.values()], activities: [...activities.values()], laterRounds };
 }
 
 /**
@@ -184,11 +204,13 @@ export function listScheduleTexts(wcif) {
  * - mbldSubmission: { enabled, task, hideForOthers } — show the MBLD cube
  *   submission as a task for the people competing in MBLD (see
  *   buildCompetitorSchedules).
- * - mergeLaterRoundGroups: one row per round 2+/final instead of one per
- *   group. Safe there because those rows print "QR" anyway — who's in
- *   which group isn't known when badges are printed.
+ * - mergedRounds: round codes (e.g. ["333-r4"]) shown as one row instead
+ *   of one per group. Only applies to round 2+/finals — safe there because
+ *   those rows print "QR" anyway, since who's in which group isn't known
+ *   when badges are printed.
  */
-function buildBaseSchedule(wcif, timeZone = "UTC", { stageColors = {}, labels = {}, mergeLaterRoundGroups = false } = {}) {
+function buildBaseSchedule(wcif, timeZone = "UTC", { stageColors = {}, labels = {}, mergedRounds = [] } = {}) {
+  const mergedRoundCodes = new Set(mergedRounds);
   const eventLabels = labels.events || {};
   const activityLabels = labels.activities || {};
   const roundAmounts = {};
@@ -351,8 +373,8 @@ function buildBaseSchedule(wcif, timeZone = "UTC", { stageColors = {}, labels = 
 
     // Merged later rounds share one key per round and day, and are labelled
     // as the round ("3x3x3 Final", "3x3x3 R2") rather than one of its groups.
-    const mergeIntoRound = mergeLaterRoundGroups && isSubsequentRound;
     const roundCode = `${codeEventId}-${codeRoundPart}`;
+    const mergeIntoRound = isSubsequentRound && mergedRoundCodes.has(roundCode);
     const key = mergeIntoRound ? `${roundCode}_${day}` : `${activity.activityCode || `noCode_${activity.id}`}_${activity.startTime}`;
     const label = mergeIntoRound
       ? shortenedFromCode(`${eventNameOf(activity.name)} Round ${codeRoundNum}`, roundCode)

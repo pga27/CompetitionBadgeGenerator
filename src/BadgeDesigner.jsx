@@ -613,7 +613,7 @@ function inflateSide(s, fallbackW, fallbackH) {
 }
 // The global settings schedule.js's builders take (see buildBaseSchedule).
 function scheduleOptions(s) {
-  return { stageColors: s.stageColors, labels: s.scheduleLabels, mbldSubmission: s.mbldSubmission, mergeLaterRoundGroups: s.mergeLaterRoundGroups };
+  return { stageColors: s.stageColors, labels: s.scheduleLabels, mbldSubmission: s.mbldSubmission, mergedRounds: s.mergedRounds };
 }
 
 function inflateTemplate(data) {
@@ -653,8 +653,8 @@ function inflateTemplate(data) {
     scheduleLabels: { events: {}, activities: {}, ...(data.schedule_labels || {}) },
     // MBLD cube submission shown as a task (see buildCompetitorSchedules).
     mbldSubmission: { enabled: false, task: "C", hideForOthers: false, ...(data.mbld_submission || {}) },
-    // One row per later round instead of one per group (see buildBaseSchedule).
-    mergeLaterRoundGroups: !!data.merge_later_round_groups,
+    // Later rounds shown as one row instead of one per group (see buildBaseSchedule).
+    mergedRounds: data.merged_rounds || [],
     fonts: inflatedFonts,
     front: inflateSide(data.front, 105, 148),
     back: inflateSide(data.back, 148, 105),
@@ -1125,7 +1125,7 @@ export default function BadgeDesigner() {
       stage_colors: state.stageColors,
       schedule_labels: state.scheduleLabels,
       mbld_submission: state.mbldSubmission,
-      merge_later_round_groups: state.mergeLaterRoundGroups,
+      merged_rounds: state.mergedRounds,
       fonts: fontsManifest,
       front: {
         page: state.front.page,
@@ -1489,8 +1489,8 @@ export default function BadgeDesigner() {
                 onLabelChange={setScheduleLabel}
                 mbldSubmission={state.mbldSubmission}
                 onMbldChange={updateMbldSubmission}
-                mergeLaterRoundGroups={state.mergeLaterRoundGroups}
-                onMergeLaterRoundGroupsChange={(v) => updateScheduleSettings({ mergeLaterRoundGroups: v })}
+                mergedRounds={state.mergedRounds}
+                onMergedRoundsChange={(codes) => updateScheduleSettings({ mergedRounds: codes })}
               />
             )}
             {selectedId === STAGECOLORS_ID && <StageColorsPanel stages={state.sampleData.stages || []} stageColors={state.stageColors} onChange={setStageColor} />}
@@ -2106,7 +2106,17 @@ function RoleMappingPanel({ roleMapping, onChange }) {
 // Global schedule settings: renames for the texts the WCIF produces, and the
 // MBLD cube submission task. Per-table settings (day, title, column
 // headers, hidden activities) stay on each schedule field.
-function SchedulePanel({ texts, labels, onLabelChange, mbldSubmission, onMbldChange, mergeLaterRoundGroups, onMergeLaterRoundGroupsChange }) {
+function SchedulePanel({ texts, labels, onLabelChange, mbldSubmission, onMbldChange, mergedRounds, onMergedRoundsChange }) {
+  const merged = new Set(mergedRounds);
+  const toggleRound = (code) => {
+    const next = new Set(merged);
+    if (next.has(code)) next.delete(code);
+    else next.add(code);
+    onMergedRoundsChange([...next]);
+  };
+  // Only rounds actually split into groups are worth offering.
+  const mergeable = (texts?.laterRounds || []).filter((r) => r.groups > 1);
+
   const renameRow = (kind, key, defaultText) => (
     <div key={key} className="flex items-center gap-1.5">
       <span className="w-28 text-[11px] text-neutral-500 truncate shrink-0" title={kind === "activities" ? key : defaultText}>
@@ -2129,14 +2139,28 @@ function SchedulePanel({ texts, labels, onLabelChange, mbldSubmission, onMbldCha
         <Rows3 size={12} /> SCHEDULE
       </div>
 
-      <div className="space-y-1">
-        <label className="flex items-center gap-2 text-xs">
-          <input type="checkbox" checked={!!mergeLaterRoundGroups} onChange={(e) => onMergeLaterRoundGroupsChange(e.target.checked)} />
-          One row per later round
-        </label>
-        <div className="text-[10px] text-neutral-400">
-          Merges all groups of a round 2, 3 or final into a single row, starting at its first group (e.g. 8 rows of "3x3x3 Final" become one). Round 1 keeps its groups, since each person has a different task in each.
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between">
+          <div className="text-[11px] font-semibold text-neutral-600">One row per round</div>
+          {mergeable.length > 0 && (
+            <div className="flex gap-2 text-[11px]">
+              <button onClick={() => onMergedRoundsChange(mergeable.map((r) => r.code))} className="text-blue-600 hover:underline">All</button>
+              <button onClick={() => onMergedRoundsChange([])} className="text-blue-600 hover:underline">None</button>
+            </div>
+          )}
         </div>
+        <div className="text-[10px] text-neutral-400">
+          Tick a round to show all its groups as a single row, starting at its first group (e.g. 8 rows of "3x3x3 Final" become one). Only later rounds are listed — in round 1 each person has a different task in each group.
+        </div>
+        {mergeable.map((r) => (
+          <label key={r.code} className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={merged.has(r.code)} onChange={() => toggleRound(r.code)} />
+            <span className="flex-1">{r.label}</span>
+            <span className="text-[10px] text-neutral-400">{r.groups} groups</span>
+          </label>
+        ))}
+        {texts && mergeable.length === 0 && <div className="text-xs text-neutral-400">No later round in this competition has more than one group.</div>}
+        {!texts && <div className="text-xs text-neutral-400">Load a WCIF to choose rounds.</div>}
       </div>
 
       <div className="space-y-2 border-t border-neutral-200 pt-3">
