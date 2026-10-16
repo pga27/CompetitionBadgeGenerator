@@ -542,6 +542,13 @@ function formatDayTitle(dateStr) {
   }
 }
 
+// Same rule as BadgeDesigner.jsx's isSpecialScheduleRow: WCIF rows are
+// classified by activityCode (so renamed breaks keep their styling), the
+// name check only covers rows without one.
+function isSpecialScheduleRow(r) {
+  return r.isSpecial || (!r.activityCode && /lunch|dinner|opening|awards|tutorial/i.test(r.event));
+}
+
 function drawScheduleField(page, field, ctx, fonts, originX, originY) {
   const x0 = originX;
   const wMm = field.w_mm;
@@ -594,9 +601,9 @@ function drawScheduleField(page, field, ctx, fonts, originX, originY) {
   const subY = topY - mmv(SCHEDULE_HEADER_H_MM);
   page.drawRectangle({ x: x0, y: subY - mmv(SCHEDULE_SUBHEADER_H_MM), width: w, height: mmv(SCHEDULE_SUBHEADER_H_MM), color: hexToRgb01(SCHEDULE_COLORS.subheaderBg) });
   const labelY = subY - mmv(SCHEDULE_SUBHEADER_H_MM) / 2;
-  centered("Time", x0 + timeW / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
-  centered("Event", x0 + timeW + (w - timeW - taskW) / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
-  centered("Task", x0 + w - taskW / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
+  centered(normText(field.columnLabels?.time || "Time"), x0 + timeW / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
+  centered(normText(field.columnLabels?.event || "Event"), x0 + timeW + (w - timeW - taskW) / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
+  centered(normText(field.columnLabels?.task || "Task"), x0 + w - taskW / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
   hline(subY - mmv(SCHEDULE_SUBHEADER_H_MM), x0, x0 + w);
   vline(x0 + timeW, subY, subY - mmv(SCHEDULE_SUBHEADER_H_MM));
   vline(x0 + w - taskW, subY, subY - mmv(SCHEDULE_SUBHEADER_H_MM));
@@ -638,7 +645,7 @@ function drawScheduleField(page, field, ctx, fonts, originX, originY) {
     } else {
       const r = block.row;
       const rowH = mmv(SCHEDULE_ROW_H_MM);
-      const isSpecial = r.isSpecial || /lunch|dinner|opening|awards|tutorial/i.test(r.event);
+      const isSpecial = isSpecialScheduleRow(r);
 
       if (!isSpecial) {
         page.drawRectangle({ x: x0, y: rowTop - rowH, width: w, height: rowH, color: hexToRgb01(r.color || "#ffffff") });
@@ -647,7 +654,7 @@ function drawScheduleField(page, field, ctx, fonts, originX, originY) {
       centered(r.time, x0 + timeW / 2, rowTop - rowH / 2, fonts.helvetica, SCHEDULE_FONT_SIZE);
 
       if (isSpecial) {
-        const bg = /lunch|dinner/i.test(r.event) ? SCHEDULE_COLORS.lunchBg : SCHEDULE_COLORS.otherSpecialBg;
+        const bg = /lunch|dinner/i.test(r.activityCode || r.event) ? SCHEDULE_COLORS.lunchBg : SCHEDULE_COLORS.otherSpecialBg;
         page.drawRectangle({ x: x0 + timeW, y: rowTop - rowH, width: w - timeW, height: rowH, color: hexToRgb01(r.specialColor || bg) });
         centered(r.event.toUpperCase(), x0 + timeW + (w - timeW) / 2, rowTop - rowH / 2, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
       } else {
@@ -676,7 +683,7 @@ function drawScheduleField(page, field, ctx, fonts, originX, originY) {
       vline(x0 + w - taskW, rowTop, bottomY);
       page.drawRectangle({ x: x0 + w - taskW, y: bottomY, width: taskW, height: h, borderColor: hexToRgb01(SCHEDULE_COLORS.border), borderWidth: 0.5 });
     } else {
-      const isSpecial = block.row.isSpecial || /lunch|dinner|opening|awards|tutorial/i.test(block.row.event);
+      const isSpecial = isSpecialScheduleRow(block.row);
       vline(x0 + timeW, rowTop, bottomY);
       if (!isSpecial) vline(x0 + w - taskW, rowTop, bottomY);
     }
@@ -1117,7 +1124,12 @@ export async function generateBadgesPdf(state, wcif, onProgress) {
     }
   }
 
-  const competitorSchedules = buildCompetitorSchedules(wcif, state.scheduleTimezone || undefined, state.stageColors || {});
+  const competitorSchedules = buildCompetitorSchedules(wcif, state.scheduleTimezone || undefined, {
+    stageColors: state.stageColors || {},
+    labels: state.scheduleLabels || {},
+    mbldSubmission: state.mbldSubmission || {},
+    mergeLaterRoundGroups: !!state.mergeLaterRoundGroups,
+  });
   const stages = buildStageList(wcif, state.stageColors || {});
 
   const persons = (wcif.persons || []).filter(

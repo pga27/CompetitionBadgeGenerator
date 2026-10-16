@@ -25,7 +25,7 @@ import {
   Users,
   SwatchBook,
 } from "lucide-react";
-import { buildCompetitorSchedules, buildGenericSchedule, buildStageList, resolveScheduleTimezone } from "./schedule.js";
+import { buildCompetitorSchedules, buildGenericSchedule, buildStageList, listScheduleTexts, resolveScheduleTimezone } from "./schedule.js";
 import { generateBadgesPdf, downloadPdfBytes } from "./pdfExport.js";
 import defaultTemplate from "./defaultTemplate.json";
 
@@ -36,6 +36,7 @@ const FONTS_ID = "__fonts__";
 const BGMAP_ID = "__bgmap__";
 const ROLEMAP_ID = "__rolemap__";
 const STAGECOLORS_ID = "__stagecolors__";
+const SCHEDULE_ID = "__schedule__";
 // Country flags, bundled into the project rather than fetched at runtime
 // — put one file per country under src/assets/flags/, named by its WCA
 // countryIso2 code (e.g. assets/flags/PT.svg, assets/flags/US.svg).
@@ -343,6 +344,13 @@ const SCHEDULE_FALLBACK_ROWS = [
   { time: "19:20", event: "Rubik's Nations Cup", task: null, isSpecial: true, specialColor: "#fbcfe8" },
 ];
 
+// Full-width "break" rows (lunch, awards…). Rows from a WCIF know this from
+// their activityCode, so renaming one (e.g. "Lunch" -> "Comida") keeps its
+// styling; the name check is only for the placeholder rows above.
+function isSpecialScheduleRow(r) {
+  return r.isSpecial || (!r.activityCode && /lunch|dinner|opening|awards|tutorial/i.test(r.event));
+}
+
 function formatDayTitle(dateStr) {
   try {
     const [y, m, d] = dateStr.split("-").map(Number);
@@ -559,6 +567,8 @@ function inflateScheduleField(f) {
     dayIndex: f.dayIndex || 0,
     customTitle: f.customTitle || "",
     excludedIds: f.excludedIds || [],
+    // Column header texts; empty means the default ("Time" / "Event" / "Task").
+    columnLabels: { time: "", event: "", task: "", ...(f.columnLabels || {}) },
   };
 }
 function inflateTaskKeyField(f) {
@@ -601,6 +611,11 @@ function inflateSide(s, fallbackW, fallbackH) {
     fields: (s?.fields || []).map(inflateField),
   };
 }
+// The global settings schedule.js's builders take (see buildBaseSchedule).
+function scheduleOptions(s) {
+  return { stageColors: s.stageColors, labels: s.scheduleLabels, mbldSubmission: s.mbldSubmission, mergeLaterRoundGroups: s.mergeLaterRoundGroups };
+}
+
 function inflateTemplate(data) {
   const inflatedFonts = Object.entries(data.fonts || {}).map(([family, meta]) => ({
     id: uid("font"),
@@ -634,6 +649,12 @@ function inflateTemplate(data) {
     // Stage name -> color to print instead of the one set on the WCA
     // website (see StageColorsPanel). Empty = WCA colors everywhere.
     stageColors: data.stage_colors || {},
+    // User renames for schedule rows (see SchedulePanel / listScheduleTexts).
+    scheduleLabels: { events: {}, activities: {}, ...(data.schedule_labels || {}) },
+    // MBLD cube submission shown as a task (see buildCompetitorSchedules).
+    mbldSubmission: { enabled: false, task: "C", hideForOthers: false, ...(data.mbld_submission || {}) },
+    // One row per later round instead of one per group (see buildBaseSchedule).
+    mergeLaterRoundGroups: !!data.merge_later_round_groups,
     fonts: inflatedFonts,
     front: inflateSide(data.front, 105, 148),
     back: inflateSide(data.back, 148, 105),
@@ -679,7 +700,7 @@ export default function BadgeDesigner() {
       // never a specific person's actual assignments. Real per-competitor
       // data (and buildCompetitorSchedules) only gets used later, in batch
       // generation, once this template is applied to the whole roster.
-      const genericSchedule = buildGenericSchedule(wcif, state.scheduleTimezone || undefined);
+      const genericSchedule = buildGenericSchedule(wcif, state.scheduleTimezone || undefined, scheduleOptions(state));
       const stages = buildStageList(wcif, state.stageColors);
 
       // Populates any "driven by country" image field's mappings from the
@@ -724,7 +745,7 @@ export default function BadgeDesigner() {
   const dragRef = useRef(null);
   const sideData = state[side];
   const fields = sideData.fields;
-  const selectedField = selectedId && selectedId !== TINT_ID && selectedId !== FONTS_ID && selectedId !== BGMAP_ID && selectedId !== ROLEMAP_ID && selectedId !== STAGECOLORS_ID ? fields.find((f) => f.id === selectedId) : null;
+  const selectedField = selectedId && selectedId !== TINT_ID && selectedId !== FONTS_ID && selectedId !== BGMAP_ID && selectedId !== ROLEMAP_ID && selectedId !== STAGECOLORS_ID && selectedId !== SCHEDULE_ID ? fields.find((f) => f.id === selectedId) : null;
 
   const updateSide = (patch) => setState((s) => ({ ...s, [side]: { ...s[side], ...patch } }));
   const updateField = (id, patch) => updateSide({ fields: sideData.fields.map((f) => (f.id === id ? { ...f, ...patch } : f)) });
@@ -748,18 +769,21 @@ export default function BadgeDesigner() {
   const updateRoleMapping = (patch) => setState((s) => ({ ...s, roleMapping: { ...s.roleMapping, ...patch } }));
   // Global too: a stage is the same color on every badge and on both sides.
   // color === null drops the override, going back to the WCA color.
-  // sampleData.stages is re-derived so the Task Key preview follows along.
+  // sampleData.stages and .schedules are re-derived so the Task Key and
+  // schedule previews follow along.
   const setStageColor = (name, color) =>
     setState((prev) => {
       const stageColors = { ...prev.stageColors };
       if (color) stageColors[name] = color;
       else delete stageColors[name];
-      const stages = prev.wcif
-        ? buildStageList(prev.wcif, stageColors)
-        : (prev.sampleData.stages || []).map((s) => {
-            const wcaColor = s.wcaColor || s.color;
-            return { ...s, wcaColor, color: stageColors[s.name] || wcaColor };
-          });
+      if (prev.wcif) {
+        const schedules = buildGenericSchedule(prev.wcif, prev.scheduleTimezone || undefined, scheduleOptions({ ...prev, stageColors }));
+        return { ...prev, stageColors, sampleData: { ...prev.sampleData, stages: buildStageList(prev.wcif, stageColors), schedules } };
+      }
+      const stages = (prev.sampleData.stages || []).map((s) => {
+        const wcaColor = s.wcaColor || s.color;
+        return { ...s, wcaColor, color: stageColors[s.name] || wcaColor };
+      });
       return { ...prev, stageColors, sampleData: { ...prev.sampleData, stages } };
     });
 
@@ -773,7 +797,7 @@ export default function BadgeDesigner() {
     if (type === "colorblock")
       Object.assign(base, { w_mm: 30, h_mm: 10, mapSource: "role", fallbackColor: "#9CA3AF", opacity: 100, mappings: [{ value: "competitor", color: "#1E5FD9" }], labelSource: "role", labelColor: "#FFFFFF" });
     if (type === "qr") Object.assign(base, { size_mm: 16, target: "https://example.org/{wcaId}" });
-    if (type === "schedule") Object.assign(base, { w_mm: 60, h_mm: 40, dayIndex: 0, customTitle: "", excludedIds: [] });
+    if (type === "schedule") Object.assign(base, { w_mm: 60, h_mm: 40, dayIndex: 0, customTitle: "", excludedIds: [], columnLabels: { time: "", event: "", task: "" } });
     if (type === "taskkey") Object.assign(base, { w_mm: 70, stageNames: [] });
     updateSide({ fields: [...fields, base] });
     setSelectedId(base.id);
@@ -832,12 +856,32 @@ export default function BadgeDesigner() {
       if (prev.wcif) {
         next.sampleData = {
           ...prev.sampleData,
-          schedules: buildGenericSchedule(prev.wcif, tz || undefined),
+          schedules: buildGenericSchedule(prev.wcif, tz || undefined, scheduleOptions(prev)),
         };
       }
       return next;
     });
   };
+  // Global like the timezone: renames and the MBLD submission task apply to
+  // every schedule field. Same re-derivation as above, for the live preview.
+  const updateScheduleSettings = (patch) =>
+    setState((prev) => {
+      const next = { ...prev, ...patch };
+      if (prev.wcif) {
+        next.sampleData = { ...prev.sampleData, schedules: buildGenericSchedule(prev.wcif, prev.scheduleTimezone || undefined, scheduleOptions(next)) };
+      }
+      return next;
+    });
+  // kind: "events" (keyed by event id) or "activities" (keyed by the
+  // activity's WCIF name). Empty text drops the rename.
+  const setScheduleLabel = (kind, key, text) => {
+    const group = { ...(state.scheduleLabels[kind] || {}) };
+    if (text) group[key] = text;
+    else delete group[key];
+    updateScheduleSettings({ scheduleLabels: { ...state.scheduleLabels, [kind]: group } });
+  };
+  const updateMbldSubmission = (patch) => updateScheduleSettings({ mbldSubmission: { ...state.mbldSubmission, ...patch } });
+  const scheduleTexts = state.wcif ? listScheduleTexts(state.wcif) : null;
   const detectedScheduleTimezone = state.wcif ? resolveScheduleTimezone(state.wcif) : null;
 
   const round1 = (v) => Math.round(v * 10) / 10;
@@ -1054,7 +1098,7 @@ export default function BadgeDesigner() {
         } else if (f.type === "qr") {
           Object.assign(out, { target: f.target, size_mm: f.size_mm });
         } else if (f.type === "schedule") {
-          Object.assign(out, { w_mm: f.w_mm, h_mm: f.h_mm, dayIndex: f.dayIndex || 0, customTitle: f.customTitle || "", excludedIds: f.excludedIds || [] });
+          Object.assign(out, { w_mm: f.w_mm, h_mm: f.h_mm, dayIndex: f.dayIndex || 0, customTitle: f.customTitle || "", excludedIds: f.excludedIds || [], columnLabels: f.columnLabels });
         } else if (f.type === "taskkey") {
           Object.assign(out, { w_mm: f.w_mm, stageNames: f.stageNames || [] });
         }
@@ -1079,6 +1123,9 @@ export default function BadgeDesigner() {
       schedule_timezone: state.scheduleTimezone || "",
       role_mapping: state.roleMapping,
       stage_colors: state.stageColors,
+      schedule_labels: state.scheduleLabels,
+      mbld_submission: state.mbldSubmission,
+      merge_later_round_groups: state.mergeLaterRoundGroups,
       fonts: fontsManifest,
       front: {
         page: state.front.page,
@@ -1237,6 +1284,10 @@ export default function BadgeDesigner() {
 
         <button onClick={() => setSelectedId(STAGECOLORS_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === STAGECOLORS_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
           <SwatchBook size={12} /> Stage colors
+        </button>
+
+        <button onClick={() => setSelectedId(SCHEDULE_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === SCHEDULE_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
+          <Rows3 size={12} /> Schedule
         </button>
 
         <div className="flex-1" />
@@ -1431,6 +1482,17 @@ export default function BadgeDesigner() {
               />
             )}
             {selectedId === ROLEMAP_ID && <RoleMappingPanel roleMapping={state.roleMapping} onChange={updateRoleMapping} />}
+            {selectedId === SCHEDULE_ID && (
+              <SchedulePanel
+                texts={scheduleTexts}
+                labels={state.scheduleLabels}
+                onLabelChange={setScheduleLabel}
+                mbldSubmission={state.mbldSubmission}
+                onMbldChange={updateMbldSubmission}
+                mergeLaterRoundGroups={state.mergeLaterRoundGroups}
+                onMergeLaterRoundGroupsChange={(v) => updateScheduleSettings({ mergeLaterRoundGroups: v })}
+              />
+            )}
             {selectedId === STAGECOLORS_ID && <StageColorsPanel stages={state.sampleData.stages || []} stageColors={state.stageColors} onChange={setStageColor} />}
             {selectedField && (
               <PropertiesPanel
@@ -1579,9 +1641,9 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
             className="flex font-semibold shrink-0 text-center items-center"
             style={{ height: SCHEDULE_SUBHEADER_HEIGHT_PX, boxSizing: "border-box", background: SCHEDULE_COLORS.subheaderBg, borderBottom: `1px solid ${SCHEDULE_COLORS.border}` }}
           >
-            <span className="w-10 h-full flex items-center justify-center shrink-0" style={{ borderRight: `1px solid ${SCHEDULE_COLORS.border}` }}>Time</span>
-            <span className="flex-1 h-full flex items-center justify-center" style={{ borderRight: `1px solid ${SCHEDULE_COLORS.border}` }}>Event</span>
-            <span className="w-9 h-full flex items-center justify-center shrink-0">Task</span>
+            <span className="w-10 h-full flex items-center justify-center shrink-0" style={{ borderRight: `1px solid ${SCHEDULE_COLORS.border}` }}>{field.columnLabels?.time || "Time"}</span>
+            <span className="flex-1 h-full flex items-center justify-center" style={{ borderRight: `1px solid ${SCHEDULE_COLORS.border}` }}>{field.columnLabels?.event || "Event"}</span>
+            <span className="w-9 h-full flex items-center justify-center shrink-0">{field.columnLabels?.task || "Task"}</span>
           </div>
 
           {/* Rows — grouped into "blocks": a normal row stays a single row,
@@ -1649,8 +1711,8 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
                 }
 
                 const r = block.row;
-                const isSpecial = r.isSpecial || /lunch|dinner|opening|awards|tutorial/i.test(r.event);
-                const specialBg = /lunch|dinner/i.test(r.event) ? SCHEDULE_COLORS.lunchBg : SCHEDULE_COLORS.otherSpecialBg;
+                const isSpecial = isSpecialScheduleRow(r);
+                const specialBg = /lunch|dinner/i.test(r.activityCode || r.event) ? SCHEDULE_COLORS.lunchBg : SCHEDULE_COLORS.otherSpecialBg;
 
                 return (
                   <div
@@ -2037,6 +2099,92 @@ function RoleMappingPanel({ roleMapping, onChange }) {
       <div className="text-[10px] text-neutral-400">
         WCA role strings per the WCIF spec include: delegate, trainee-delegate, organizer, staff-judge, staff-scrambler, staff-runner, staff-dataentry, staff-announcer.
       </div>
+    </div>
+  );
+}
+
+// Global schedule settings: renames for the texts the WCIF produces, and the
+// MBLD cube submission task. Per-table settings (day, title, column
+// headers, hidden activities) stay on each schedule field.
+function SchedulePanel({ texts, labels, onLabelChange, mbldSubmission, onMbldChange, mergeLaterRoundGroups, onMergeLaterRoundGroupsChange }) {
+  const renameRow = (kind, key, defaultText) => (
+    <div key={key} className="flex items-center gap-1.5">
+      <span className="w-28 text-[11px] text-neutral-500 truncate shrink-0" title={kind === "activities" ? key : defaultText}>
+        {defaultText}
+      </span>
+      <span className="text-neutral-300 text-xs">→</span>
+      <input
+        type="text"
+        value={labels[kind]?.[key] || ""}
+        placeholder={defaultText}
+        onChange={(e) => onLabelChange(kind, key, e.target.value)}
+        className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0"
+      />
+    </div>
+  );
+
+  return (
+    <div className="p-4 space-y-4 border-t border-neutral-200 overflow-y-auto">
+      <div className="text-xs font-semibold text-neutral-500 flex items-center gap-1.5">
+        <Rows3 size={12} /> SCHEDULE
+      </div>
+
+      <div className="space-y-1">
+        <label className="flex items-center gap-2 text-xs">
+          <input type="checkbox" checked={!!mergeLaterRoundGroups} onChange={(e) => onMergeLaterRoundGroupsChange(e.target.checked)} />
+          One row per later round
+        </label>
+        <div className="text-[10px] text-neutral-400">
+          Merges all groups of a round 2, 3 or final into a single row, starting at its first group (e.g. 8 rows of "3x3x3 Final" become one). Round 1 keeps its groups, since each person has a different task in each.
+        </div>
+      </div>
+
+      <div className="space-y-2 border-t border-neutral-200 pt-3">
+        <div className="text-[11px] font-semibold text-neutral-600">MBLD cube submission</div>
+        <label className="flex items-center gap-2 text-xs">
+          <input type="checkbox" checked={!!mbldSubmission.enabled} onChange={(e) => onMbldChange({ enabled: e.target.checked })} />
+          Show it as a task
+        </label>
+        {mbldSubmission.enabled && (
+          <>
+            <label className="flex items-center gap-2 text-xs">
+              <span className="text-neutral-500">Task for MBLD competitors</span>
+              <input
+                type="text"
+                value={mbldSubmission.task || ""}
+                placeholder="C"
+                maxLength={3}
+                onChange={(e) => onMbldChange({ task: e.target.value })}
+                className="w-14 text-xs px-2 py-1 border border-neutral-300 rounded-md text-center font-bold"
+              />
+            </label>
+            <label className="flex items-center gap-2 text-xs">
+              <input type="checkbox" checked={!!mbldSubmission.hideForOthers} onChange={(e) => onMbldChange({ hideForOthers: e.target.checked })} />
+              Hide it from everyone else
+            </label>
+          </>
+        )}
+        <div className="text-[10px] text-neutral-400">
+          People assigned to the submission itself (e.g. staff collecting cubes) get their usual task letter. Competitors get the task above for each attempt they're assigned to compete in — or, before groups exist, if they're registered for MBLD.
+        </div>
+      </div>
+
+      {texts ? (
+        <>
+          <div className="space-y-1.5 border-t border-neutral-200 pt-3">
+            <div className="text-[11px] font-semibold text-neutral-600">Event names</div>
+            <div className="text-[10px] text-neutral-400">Replaces the event part of every row, e.g. "3x3 OH R1 - G2" → "OH R1 - G2". Leave blank to keep the default.</div>
+            {texts.events.map((ev) => renameRow("events", ev.id, ev.defaultText))}
+          </div>
+          <div className="space-y-1.5 border-t border-neutral-200 pt-3">
+            <div className="text-[11px] font-semibold text-neutral-600">Other activities</div>
+            <div className="text-[10px] text-neutral-400">Breaks and other non-event rows, as named in the WCIF.</div>
+            {texts.activities.map((a) => renameRow("activities", a.name, a.defaultText))}
+          </div>
+        </>
+      ) : (
+        <div className="text-xs text-neutral-400 border-t border-neutral-200 pt-3">Load a WCIF to rename its events and activities.</div>
+      )}
     </div>
   );
 }
@@ -2479,6 +2627,23 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
                 className="w-full text-xs px-2 py-1.5 border border-neutral-300 rounded-md"
               />
             </label>
+
+            <div>
+              <div className="text-[11px] text-neutral-500 mb-1">Column headers</div>
+              <div className="grid grid-cols-3 gap-1.5">
+                {[["time", "Time"], ["event", "Event"], ["task", "Task"]].map(([key, fallback]) => (
+                  <input
+                    key={key}
+                    type="text"
+                    placeholder={fallback}
+                    value={field.columnLabels?.[key] || ""}
+                    onChange={(e) => onChange({ columnLabels: { ...field.columnLabels, [key]: e.target.value } })}
+                    className="w-full text-xs px-2 py-1.5 border border-neutral-300 rounded-md min-w-0"
+                  />
+                ))}
+              </div>
+              <div className="text-[10px] text-neutral-400 mt-1">Event and activity names are renamed for every table under "Schedule" in the toolbar.</div>
+            </div>
 
             {/* Other / Special Activities Toggle List */}
             <div className="border-t border-neutral-200 pt-2.5">
