@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import {
   Type,
   Image as ImageIcon,
@@ -24,6 +24,7 @@ import {
   ChevronDown,
   Users,
   SwatchBook,
+  TriangleAlert,
 } from "lucide-react";
 import { buildCompetitorSchedules, buildGenericSchedule, buildStageList, listScheduleTexts, resolveScheduleTimezone } from "./schedule.js";
 import { generateBadgesPdf, downloadPdfBytes } from "./pdfExport.js";
@@ -594,6 +595,9 @@ function inflateField(f) {
 function inflateSide(s, fallbackW, fallbackH) {
   return {
     page: s?.page || { width_mm: fallbackW, height_mm: fallbackH },
+    // Safe area inset from every edge, in mm: only a design guide (snapping
+    // + warnings), never printed. 0 turns it off.
+    safeMarginMm: s?.safe_margin_mm ?? 3,
     background: s?.background_data || null,
     backgroundName: s?.background || "assets/background.png",
     tint: s?.background_tint
@@ -668,6 +672,10 @@ export default function BadgeDesigner() {
   const [showData, setShowData] = useState(false);
   const [generating, setGenerating] = useState(null); // null | { done, total } | "error"
   const [guides, setGuides] = useState({ x: null, y: null });
+  // Ids of fields reaching past the safe margin, measured from what's
+  // actually drawn (so auto-width text, alignment and rotation all count).
+  const canvasRef = useRef(null);
+  const [outsideIds, setOutsideIds] = useState([]);
 
   // Inside BadgeDesigner component:
   const loadWcifData = async (compIdOrFile) => {
@@ -745,6 +753,33 @@ export default function BadgeDesigner() {
   const dragRef = useRef(null);
   const sideData = state[side];
   const fields = sideData.fields;
+
+  // Re-measured after every render (fields, fonts, sample data and page
+  // size all move things), on the next frame so the layout is settled; the
+  // functional update keeps the same array when nothing changed, so it
+  // doesn't trigger another render.
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const m = (sideData.safeMarginMm || 0) * SCALE;
+      const page = canvas.getBoundingClientRect();
+      const safe = { left: page.left + m, top: page.top + m, right: page.right - m, bottom: page.bottom - m };
+      const TOL = 0.5; // px, so a field snapped exactly onto the line doesn't count
+      const next = [];
+      if (m > 0) {
+        for (const el of canvas.querySelectorAll("[data-field-id]")) {
+          // A non-wrapping text box is auto-width and its text is shifted by
+          // its alignment, so measure the text itself rather than the box.
+          const target = el.dataset.fieldType === "text" && el.firstElementChild ? el.firstElementChild : el;
+          const r = target.getBoundingClientRect();
+          if (r.left < safe.left - TOL || r.top < safe.top - TOL || r.right > safe.right + TOL || r.bottom > safe.bottom + TOL) next.push(el.dataset.fieldId);
+        }
+      }
+      setOutsideIds((prev) => (prev.join() === next.join() ? prev : next));
+    });
+    return () => cancelAnimationFrame(frame);
+  });
   const selectedField = selectedId && selectedId !== TINT_ID && selectedId !== FONTS_ID && selectedId !== BGMAP_ID && selectedId !== ROLEMAP_ID && selectedId !== STAGECOLORS_ID && selectedId !== SCHEDULE_ID ? fields.find((f) => f.id === selectedId) : null;
 
   const updateSide = (patch) => setState((s) => ({ ...s, [side]: { ...s[side], ...patch } }));
@@ -920,36 +955,43 @@ export default function BadgeDesigner() {
       const h = d.origH;
       const others = sd.fields.filter((f) => f.id !== d.id);
 
+      // [position to snap to, where to draw the guide line]: alignment
+      // snaps show the field's center line, safe-margin snaps the margin.
+      const m = sd.safeMarginMm || 0;
+      const marginX = m > 0 ? [[m, m], [pw - m - w, pw - m]] : [];
+      const marginY = m > 0 ? [[m, m], [ph - m - h, ph - m]] : [];
       const candX = [
-        (pw - w) / 2,
+        ...marginX,
+        [(pw - w) / 2, pw / 2],
         ...others.flatMap((f) => {
           const fw = fieldBoxWidthMm(f); // 0 for a non-wrap text field, its real box width when wrapped
-          return [f.x_mm, f.x_mm + fw - w, f.x_mm + fw / 2 - w / 2];
+          return [f.x_mm, f.x_mm + fw - w, f.x_mm + fw / 2 - w / 2].map((c) => [c, c + w / 2]);
         }),
       ];
       const candY = [
-        (ph - h) / 2,
+        ...marginY,
+        [(ph - h) / 2, ph / 2],
         ...others.flatMap((f) => {
           const fh = fieldBoxHeightMm(f);
-          return [f.y_mm, f.y_mm + fh - h, f.y_mm + fh / 2 - h / 2];
+          return [f.y_mm, f.y_mm + fh - h, f.y_mm + fh / 2 - h / 2].map((c) => [c, c + h / 2]);
         }),
       ];
 
       let nx = rawX;
       let gx = null;
-      for (const c of candX) {
+      for (const [c, guide] of candX) {
         if (Math.abs(rawX - c) <= SNAP_TOL) {
           nx = c;
-          gx = c + w / 2;
+          gx = guide;
           break;
         }
       }
       let ny = rawY;
       let gy = null;
-      for (const c of candY) {
+      for (const [c, guide] of candY) {
         if (Math.abs(rawY - c) <= SNAP_TOL) {
           ny = c;
-          gy = c + h / 2;
+          gy = guide;
           break;
         }
       }
@@ -1129,6 +1171,7 @@ export default function BadgeDesigner() {
       fonts: fontsManifest,
       front: {
         page: state.front.page,
+        safe_margin_mm: state.front.safeMarginMm,
         background: state.front.backgroundName,
         background_data: state.front.background || null,
         background_tint: cleanTint(state.front.tint),
@@ -1137,6 +1180,7 @@ export default function BadgeDesigner() {
       },
       back: {
         page: state.back.page,
+        safe_margin_mm: state.back.safeMarginMm,
         background: state.back.backgroundName,
         background_data: state.back.background || null,
         background_tint: cleanTint(state.back.tint),
@@ -1256,6 +1300,12 @@ export default function BadgeDesigner() {
           <span>mm</span>
         </div>
 
+        <label className="flex items-center gap-1.5 text-xs text-neutral-500" title="Safe margin: a guide drawn this far inside every edge while designing. Not printed.">
+          <span>Margin</span>
+          <input type="number" min={0} step={0.5} value={sideData.safeMarginMm} onChange={(e) => updateSide({ safeMarginMm: clamp(Number(e.target.value) || 0, 0, Math.min(sideData.page.width_mm, sideData.page.height_mm) / 2) })} className="w-12 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" />
+          <span>mm</span>
+        </label>
+
         <label className="flex items-center gap-1.5 text-sm px-3 py-1.5 border border-neutral-300 rounded-md cursor-pointer hover:bg-neutral-50">
           <Upload size={14} />
           Background
@@ -1345,7 +1395,7 @@ export default function BadgeDesigner() {
 
       <div className="flex flex-1 overflow-hidden">
         <div className="flex-1 flex items-center justify-center p-8 overflow-auto">
-          <div onPointerDown={() => setSelectedId(null)} style={{ width: pw, height: ph, backgroundColor: "#ffffff", position: "relative" }} className="shadow-lg border border-neutral-300 rounded-sm overflow-hidden">
+          <div ref={canvasRef} onPointerDown={() => setSelectedId(null)} style={{ width: pw, height: ph, backgroundColor: "#ffffff", position: "relative" }} className="shadow-lg border border-neutral-300 rounded-sm overflow-hidden">
             {bgMapEnabled ? (
               bgMapSrc && <img src={bgMapSrc} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }} />
             ) : (
@@ -1357,8 +1407,18 @@ export default function BadgeDesigner() {
               )
             )}
             {fields.map((f) => (
-              <FieldBox key={f.id} field={f} scale={SCALE} selected={selectedId === f.id} sampleData={state.sampleData} onPointerDownMove={(e) => startDrag(e, f, "move")} onPointerDownResize={(e) => startDrag(e, f, "resize")} />
+              <FieldBox key={f.id} field={f} scale={SCALE} selected={selectedId === f.id} outsideMargin={outsideIds.includes(f.id)} sampleData={state.sampleData} onPointerDownMove={(e) => startDrag(e, f, "move")} onPointerDownResize={(e) => startDrag(e, f, "resize")} />
             ))}
+            {sideData.safeMarginMm > 0 && (
+              <div
+                style={{
+                  position: "absolute",
+                  inset: sideData.safeMarginMm * SCALE,
+                  border: "1px dashed rgba(236, 72, 153, 0.8)",
+                  pointerEvents: "none",
+                }}
+              />
+            )}
             {guides.x !== null && (
               <div style={{ position: "absolute", left: guides.x * SCALE, top: 0, bottom: 0, width: 1, background: "#2563eb", pointerEvents: "none" }} />
             )}
@@ -1429,6 +1489,11 @@ export default function BadgeDesigner() {
                       <GripVertical size={13} className="text-neutral-300 cursor-grab shrink-0" />
                       <Icon size={14} className="shrink-0" />
                       <span className="flex-1 truncate">{fieldLabel}</span>
+                      {outsideIds.includes(f.id) && (
+                        <span title="Goes past the safe margin — it may get cut off when printing" className="text-amber-500 shrink-0">
+                          <TriangleAlert size={13} />
+                        </span>
+                      )}
                       <div className="flex flex-col shrink-0">
                         <button
                           onClick={(e) => {
@@ -1517,7 +1582,7 @@ export default function BadgeDesigner() {
   );
 }
 
-function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPointerDownResize }) {
+function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointerDownMove, onPointerDownResize }) {
   const w = fieldBoxWidthMm(field) * scale;
   const textWraps = field.type === "text" && field.wrap;
   const align = field.align || "left";
@@ -1554,7 +1619,7 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
     top: field.y_mm * scale,
     width: field.type === "text" ? (textWraps ? w : "auto") : w,
     height: field.type === "text" ? "auto" : h,
-    outline: selected ? "1.5px solid #2563eb" : "1px dashed rgba(0,0,0,0.25)",
+    outline: selected ? "1.5px solid #2563eb" : outsideMargin ? "1.5px dashed #f59e0b" : "1px dashed rgba(0,0,0,0.25)",
     cursor: "move",
     userSelect: "none",
     transform: field.rotate ? `rotate(-${field.rotate}deg)` : undefined,
@@ -1825,7 +1890,7 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
   }
 
   return (
-    <div style={style} onPointerDown={onPointerDownMove}>
+    <div style={style} data-field-id={field.id} data-field-type={field.type} onPointerDown={onPointerDownMove}>
       {content}
       {selected && (field.type !== "text" || textWraps) && (
         <div
