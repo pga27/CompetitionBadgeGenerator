@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect } from "react";
+import React, { useState, useRef, useEffect, useLayoutEffect } from "react";
 import {
   Type,
   Image as ImageIcon,
@@ -7,10 +7,8 @@ import {
   Rows3,
   Trash2,
   Plus,
-  Download,
   Upload,
   RotateCw,
-  Palette,
   X,
   Droplet,
   AlignLeft,
@@ -26,6 +24,34 @@ import {
   SwatchBook,
   Crop,
   TriangleAlert,
+  Undo2,
+  Redo2,
+  Shapes,
+  Layers,
+  Trophy,
+  Wallpaper,
+  Database,
+  Keyboard,
+  PanelLeftClose,
+  ZoomIn,
+  ZoomOut,
+  Maximize,
+  FolderOpen,
+  Save,
+  BadgeCheck,
+  CopyPlus,
+  BringToFront,
+  SendToBack,
+  ArrowUp,
+  ArrowDown,
+  AlignHorizontalJustifyStart,
+  AlignHorizontalJustifyCenter,
+  AlignHorizontalJustifyEnd,
+  AlignVerticalJustifyStart,
+  AlignVerticalJustifyCenter,
+  AlignVerticalJustifyEnd,
+  AlignHorizontalDistributeCenter,
+  AlignVerticalDistributeCenter,
 } from "lucide-react";
 import { buildCompetitorSchedules, buildGenericSchedule, buildStageList, listScheduleTexts, resolveScheduleTimezone } from "./schedule.js";
 import { generateBadgesPdf, downloadPdfBytes } from "./pdfExport.js";
@@ -34,15 +60,12 @@ import { applyTextCase, DEFAULT_FRAME, layoutTextFrame, shrinkToWidth } from "./
 import { FULL_CROP, isFullCrop, normalizeCrop, placeImage } from "./imageCrop.js";
 import { addRolesFromPersons, countByRule } from "./roles.js";
 import { pickMappedLabel } from "./valueMap.js";
+import { useHistory } from "./editor/useHistory.js";
+import ShortcutsDialog from "./editor/ShortcutsDialog.jsx";
+import AboutDialog from "./editor/AboutDialog.jsx";
 
 const SCALE = 5.2; // px per mm
 const MIN_MM = 4;
-const TINT_ID = "__tint__";
-const FONTS_ID = "__fonts__";
-const BGMAP_ID = "__bgmap__";
-const ROLEMAP_ID = "__rolemap__";
-const STAGECOLORS_ID = "__stagecolors__";
-const SCHEDULE_ID = "__schedule__";
 // Country flags, bundled into the project rather than fetched at runtime
 // — put one file per country under src/assets/flags/, named by its WCA
 // countryIso2 code (e.g. assets/flags/PT.svg, assets/flags/US.svg).
@@ -728,19 +751,68 @@ function inflateTemplate(data) {
   };
 }
 
+// On-screen size of a millimetre at "100%" zoom: real size on a standard
+// 96 dpi screen. The page itself is drawn at SCALE px/mm and zoomed with a
+// CSS scale, so zoom 1 shows it at SCALE / REAL_PX_PER_MM (about 138%).
+const REAL_PX_PER_MM = 96 / 25.4;
+const ZOOM_STEPS_PCT = [10, 25, 33, 50, 67, 75, 100, 125, 150, 200, 300, 400, 600, 800];
+const pctToZoom = (pct) => ((pct / 100) * REAL_PX_PER_MM) / SCALE;
+const zoomToPct = (zoom) => (zoom * SCALE * 100) / REAL_PX_PER_MM;
+const VIEWPORT_PAD = 48; // px of grey around the page
+
+// Left rail tabs, Canva style: each opens its panel next to the rail.
+const LEFT_TABS = [
+  { id: "elements", label: "Elements", icon: Shapes },
+  { id: "layers", label: "Layers", icon: Layers },
+  { id: "competition", label: "Competition", icon: Trophy },
+  { id: "background", label: "Background", icon: Wallpaper },
+  { id: "fonts", label: "Fonts", icon: Type },
+  { id: "data", label: "Data", icon: Database },
+];
+
+// Whether a key event comes from somewhere the user is typing, where the
+// browser's own shortcuts (copy, undo, arrows…) must keep working.
+function isTypingTarget(target) {
+  return !!target?.closest?.('input, textarea, select, [contenteditable="true"]');
+}
+
+// Marker for fields copied to the system clipboard, so a paste — in this
+// tab or another one — can tell them apart from ordinary text.
+const CLIPBOARD_MARKER = "competition-badge-generator/fields";
+
+function fieldDisplayName(f) {
+  if (f.type === "text") return f.bindMode === "static" ? `"${(f.staticText || "").slice(0, 18)}"` : f.bindMode === "template" ? f.template || "(template)" : f.source;
+  return TYPE_META[f.type].label;
+}
+
 export default function BadgeDesigner() {
-  const [state, setState] = useState(initialState);
+  // The document (everything that's saved in template.json, plus the loaded
+  // WCIF) is undoable; the rest — which side is shown, selection, zoom,
+  // open panels — is view state.
+  const { doc: state, setDoc: setState, undo, redo, canUndo, canRedo } = useHistory(initialState);
   const [side, setSide] = useState("front");
-  const [selectedId, setSelectedId] = useState(null);
-  const [showData, setShowData] = useState(false);
-  const [generating, setGenerating] = useState(null); // null | { done, total } | "error"
+  const [rawSelectedIds, setSelectedIds] = useState([]);
+  const [activeTab, setActiveTab] = useState("elements"); // left panel; null = closed
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [showAbout, setShowAbout] = useState(false);
+  const [generating, setGenerating] = useState(null); // null | { done, total }
   const [guides, setGuides] = useState({ x: null, y: null });
+  const [zoom, setZoom] = useState(1);
+  const [marquee, setMarquee] = useState(null); // selection box, client px { left, top, right, bottom }
+  const [spaceDown, setSpaceDown] = useState(false);
+  const [panning, setPanning] = useState(false);
+  const [compIdInput, setCompIdInput] = useState("");
+  const [showCompMenu, setShowCompMenu] = useState(false);
+  const [draggingFieldId, setDraggingFieldId] = useState(null); // layers list drag & drop
   // Ids of fields reaching past the safe margin, measured from what's
   // actually drawn (so auto-width text, alignment and rotation all count).
-  const canvasRef = useRef(null);
   const [outsideIds, setOutsideIds] = useState([]);
+  const canvasRef = useRef(null);
+  const viewportRef = useRef(null);
+  const importInputRef = useRef(null);
+  const zoomAnchorRef = useRef(null); // keeps the point under the pointer still while zooming
+  const pasteCountRef = useRef(0); // how many times the clipboard has been pasted, to offset copies
 
-  // Inside BadgeDesigner component:
   const loadWcifData = async (compIdOrFile) => {
     try {
       let wcif;
@@ -819,16 +891,21 @@ export default function BadgeDesigner() {
   const dragRef = useRef(null);
   const sideData = state[side];
   const fields = sideData.fields;
+  // Only fields that exist on the side being shown count as selected (undo,
+  // deleting or switching sides can take selected fields away).
+  const selectedIds = rawSelectedIds.filter((id) => fields.some((f) => f.id === id));
+  const selectedFields = fields.filter((f) => selectedIds.includes(f.id));
+  const selectedField = selectedFields.length === 1 ? selectedFields[0] : null;
 
-  // Re-measured after every render (fields, fonts, sample data and page
-  // size all move things), on the next frame so the layout is settled; the
-  // functional update keeps the same array when nothing changed, so it
-  // doesn't trigger another render.
+  // Re-measured after every render (fields, fonts, sample data, zoom and
+  // page size all move things), on the next frame so the layout is
+  // settled; the functional update keeps the same array when nothing
+  // changed, so it doesn't trigger another render.
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
       const canvas = canvasRef.current;
       if (!canvas) return;
-      const m = (sideData.safeMarginMm || 0) * SCALE;
+      const m = (sideData.safeMarginMm || 0) * SCALE * zoom;
       const page = canvas.getBoundingClientRect();
       const safe = { left: page.left + m, top: page.top + m, right: page.right - m, bottom: page.bottom - m };
       const TOL = 0.5; // px, so a field snapped exactly onto the line doesn't count
@@ -846,10 +923,12 @@ export default function BadgeDesigner() {
     });
     return () => cancelAnimationFrame(frame);
   });
-  const selectedField = selectedId && selectedId !== TINT_ID && selectedId !== FONTS_ID && selectedId !== BGMAP_ID && selectedId !== ROLEMAP_ID && selectedId !== STAGECOLORS_ID && selectedId !== SCHEDULE_ID ? fields.find((f) => f.id === selectedId) : null;
 
-  const updateSide = (patch) => setState((s) => ({ ...s, [side]: { ...s[side], ...patch } }));
-  const updateField = (id, patch) => updateSide({ fields: sideData.fields.map((f) => (f.id === id ? { ...f, ...patch } : f)) });
+  // `key` groups edits into one undo step (see useHistory).
+  const updateSide = (patch, key) => setState((s) => ({ ...s, [side]: { ...s[side], ...patch } }), key);
+  const updateField = (id, patch) =>
+    setState((s) => ({ ...s, [side]: { ...s[side], fields: s[side].fields.map((f) => (f.id === id ? { ...f, ...patch } : f)) } }), `field:${id}:${Object.keys(patch).sort().join()}`);
+  const setFields = (fn, key) => setState((s) => ({ ...s, [side]: { ...s[side], fields: fn(s[side].fields) } }), key);
 
   // Manual re-sync for a single field — for when mapSource is set to
   // "country" AFTER a WCIF is already loaded (the automatic sync in
@@ -857,17 +936,17 @@ export default function BadgeDesigner() {
   // flag files under src/assets/flags/ without reloading the WCIF.
   const syncCountryFlagsForField = async (fieldId) => {
     if (!state.wcif) {
-      alert("Load a WCIF first (the \"Load WCIF JSON\" control) — flags are fetched per the competitors it contains.");
+      alert("Load a WCIF first (Competition tab) — flags are fetched per the competitors it contains.");
       return;
     }
     const entries = await fetchFlagMappingEntries(state.wcif);
     updateField(fieldId, { mappings: upsertMappingsByValue(sideData.fields.find((f) => f.id === fieldId)?.mappings || [], entries) });
   };
-  const updateTint = (patch) => updateSide({ tint: { ...sideData.tint, ...patch } });
-  const updateBackgroundMap = (patch) => updateSide({ backgroundMap: { ...sideData.backgroundMap, ...patch } });
+  const updateTint = (patch) => updateSide({ tint: { ...sideData.tint, ...patch } }, `tint:${side}:${Object.keys(patch).join()}`);
+  const updateBackgroundMap = (patch) => updateSide({ backgroundMap: { ...sideData.backgroundMap, ...patch } }, `bgmap:${side}:${Object.keys(patch).join()}`);
   // Global, not per-side (like scheduleTimezone) — a person's role doesn't
   // change between the front and back of their own badge.
-  const updateRoleMapping = (patch) => setState((s) => ({ ...s, roleMapping: { ...s.roleMapping, ...patch } }));
+  const updateRoleMapping = (patch) => setState((s) => ({ ...s, roleMapping: { ...s.roleMapping, ...patch } }), `rolemap:${Object.keys(patch).join()}`);
   // Global too: a stage is the same color on every badge and on both sides.
   // color === null drops the override, going back to the WCA color.
   // sampleData.stages and .schedules are re-derived so the Task Key and
@@ -886,7 +965,17 @@ export default function BadgeDesigner() {
         return { ...s, wcaColor, color: stageColors[s.name] || wcaColor };
       });
       return { ...prev, stageColors, sampleData: { ...prev.sampleData, stages } };
-    });
+    }, `stagecolor:${name}`);
+
+  // ---------- adding, deleting, copying ----------
+
+  const round1 = (v) => Math.round(v * 10) / 10;
+  const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
+
+  const addFieldObjects = (newFields) => {
+    setFields((fs) => [...fs, ...newFields]);
+    setSelectedIds(newFields.map((f) => f.id));
+  };
 
   const addField = (type) => {
     const count = fields.filter((f) => f.type === type).length;
@@ -900,27 +989,142 @@ export default function BadgeDesigner() {
     if (type === "qr") Object.assign(base, { size_mm: 16, target: "https://example.org/{wcaId}" });
     if (type === "schedule") Object.assign(base, { w_mm: 60, h_mm: 40, dayIndex: 0, customTitle: "", excludedIds: [], columnLabels: { time: "", event: "", task: "" } });
     if (type === "taskkey") Object.assign(base, { w_mm: 70, stageNames: [] });
-    updateSide({ fields: [...fields, base] });
-    setSelectedId(base.id);
+    addFieldObjects([base]);
   };
 
-  const removeField = (id) => {
-    updateSide({ fields: fields.filter((f) => f.id !== id) });
-    if (selectedId === id) setSelectedId(null);
+  // A copy of a field with a fresh id, moved by dx/dy mm.
+  const cloneField = (f, dx, dy) => ({ ...structuredClone(f), id: uid(f.type), x_mm: round1(f.x_mm + dx), y_mm: round1(f.y_mm + dy) });
+
+  const deleteSelection = () => {
+    if (selectedIds.length === 0) return;
+    setFields((fs) => fs.filter((f) => !selectedIds.includes(f.id)));
+    setSelectedIds([]);
   };
+
+  const duplicateSelection = () => {
+    if (selectedFields.length === 0) return;
+    addFieldObjects(selectedFields.map((f) => cloneField(f, 4, 4)));
+  };
+
+  // Pasted image or text from another app becomes a new field, centered.
+  const pasteImage = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const w = Math.min(40, sideData.page.width_mm * 0.6);
+        const h = round1((w * img.naturalHeight) / (img.naturalWidth || 1));
+        addFieldObjects([
+          {
+            id: uid("image"),
+            type: "image",
+            x_mm: round1((sideData.page.width_mm - w) / 2),
+            y_mm: round1((sideData.page.height_mm - h) / 2),
+            rotate: 0,
+            w_mm: w,
+            h_mm: h,
+            mapped: false,
+            path: `assets/${file.name || "pasted.png"}`,
+            preview: reader.result,
+            mapSource: "role",
+            fallbackPath: "assets/default.png",
+            fallbackPreview: null,
+            mappings: [],
+            crop: { x: 0, y: 0, w: 1, h: 1 },
+            fit: "contain",
+          },
+        ]);
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  };
+  const pasteText = (text) => {
+    const f = { id: uid("text"), type: "text", x_mm: round1(sideData.page.width_mm / 2), y_mm: round1(sideData.page.height_mm / 2), rotate: 0, ...textFieldDefaults() };
+    Object.assign(f, { bindMode: "static", staticText: text, align: "center", size: 14 });
+    addFieldObjects([f]);
+  };
+
+  // System clipboard, so copies also paste into another tab of the app;
+  // images and text copied from other apps paste as new fields.
+  useEffect(() => {
+    const copySelection = (e) => {
+      // Text highlighted on the page (a label, a panel…) copies as usual.
+      if (isTypingTarget(e.target) || selectedFields.length === 0 || window.getSelection()?.toString()) return false;
+      e.clipboardData.setData("text/plain", JSON.stringify({ [CLIPBOARD_MARKER]: true, side, fields: selectedFields }));
+      e.preventDefault();
+      pasteCountRef.current = 0;
+      return true;
+    };
+    const onCopy = (e) => copySelection(e);
+    const onCut = (e) => {
+      if (copySelection(e)) deleteSelection();
+    };
+    const onPaste = (e) => {
+      if (isTypingTarget(e.target)) return;
+      const dt = e.clipboardData;
+      const image = [...(dt.files || [])].find((f) => f.type.startsWith("image/"));
+      if (image) {
+        e.preventDefault();
+        pasteImage(image);
+        return;
+      }
+      const text = dt.getData("text/plain");
+      if (!text) return;
+      e.preventDefault();
+      let copied = null;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && parsed[CLIPBOARD_MARKER]) copied = parsed;
+      } catch {
+        // not ours: plain text
+      }
+      if (!copied) {
+        pasteText(text.trim());
+        return;
+      }
+      // Pasting where the originals still are: step each paste down-right
+      // so the copies don't hide under them; elsewhere, paste in place.
+      const onTop = copied.side === side && copied.fields.some((f) => fields.some((g) => g.id === f.id && g.x_mm === f.x_mm && g.y_mm === f.y_mm));
+      const step = onTop ? 4 * ++pasteCountRef.current : 0;
+      addFieldObjects(copied.fields.map((f) => cloneField(f, step, step)));
+    };
+    document.addEventListener("copy", onCopy);
+    document.addEventListener("cut", onCut);
+    document.addEventListener("paste", onPaste);
+    return () => {
+      document.removeEventListener("copy", onCopy);
+      document.removeEventListener("cut", onCut);
+      document.removeEventListener("paste", onPaste);
+    };
+  });
+
+  // ---------- order (depth) ----------
 
   // Field DEPTH (stacking order): both the canvas preview (fields.map at
   // render time — later array entries land later in the DOM, so they sit
   // visually on top) and pdfExport.js's draw loop (later entries painted
   // last onto the same PDF page) already treat `fields` array order as
-  // depth order, back-to-front. So reordering is really just "let the
-  // user rearrange this array" — nothing downstream needs to change.
+  // depth order, back-to-front.
   //
-  // The sidebar list is shown reversed relative to storage, so the TOP
-  // row is the FRONTMOST field (last in the actual array) — matching the
-  // usual layers-panel convention (Figma, Photoshop, etc.), rather than
-  // the less intuitive "front = bottom of the list".
-  const [draggingFieldId, setDraggingFieldId] = useState(null);
+  // The layers list is shown reversed relative to storage, so the TOP row
+  // is the FRONTMOST field (last in the actual array) — the usual layers
+  // panel convention (Figma, Photoshop, etc.).
+  const reorderSelection = (how) => {
+    const sel = new Set(selectedIds);
+    if (sel.size === 0) return;
+    setFields((fs) => {
+      const next = [...fs];
+      if (how === "front") return [...next.filter((f) => !sel.has(f.id)), ...next.filter((f) => sel.has(f.id))];
+      if (how === "back") return [...next.filter((f) => sel.has(f.id)), ...next.filter((f) => !sel.has(f.id))];
+      if (how === "forward") {
+        for (let i = next.length - 2; i >= 0; i--) if (sel.has(next[i].id) && !sel.has(next[i + 1].id)) [next[i], next[i + 1]] = [next[i + 1], next[i]];
+      } else {
+        for (let i = 1; i < next.length; i++) if (sel.has(next[i].id) && !sel.has(next[i - 1].id)) [next[i], next[i - 1]] = [next[i - 1], next[i]];
+      }
+      return next;
+    });
+  };
 
   const reorderFields = (draggedId, targetId) => {
     if (draggedId === targetId) return;
@@ -930,20 +1134,72 @@ export default function BadgeDesigner() {
     if (fromIdx === -1 || toIdx === -1) return;
     const [moved] = displayOrder.splice(fromIdx, 1);
     displayOrder.splice(toIdx, 0, moved);
-    updateSide({ fields: [...displayOrder].reverse() });
+    setFields(() => [...displayOrder].reverse());
   };
 
-  // dir: -1 moves one step up the visible list (more toward the front),
-  // +1 moves one step down (more toward the back).
-  const moveFieldInList = (id, dir) => {
-    const displayOrder = [...fields].reverse();
-    const idx = displayOrder.findIndex((f) => f.id === id);
-    if (idx === -1) return;
-    const newIdx = idx + dir;
-    if (newIdx < 0 || newIdx >= displayOrder.length) return;
-    [displayOrder[idx], displayOrder[newIdx]] = [displayOrder[newIdx], displayOrder[idx]];
-    updateSide({ fields: [...displayOrder].reverse() });
+  // ---------- align & distribute ----------
+
+  // Each selected field's drawn bounds in mm from the page's top-left,
+  // measured on screen so every kind of field (auto-width text, rotated
+  // fields…) is handled the same way.
+  const measureFields = (ids) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return [];
+    const page = canvas.getBoundingClientRect();
+    const k = SCALE * zoom;
+    return ids
+      .map((id) => {
+        const el = canvas.querySelector(`[data-field-id="${CSS.escape(id)}"]`);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { id, l: (r.left - page.left) / k, t: (r.top - page.top) / k, r: (r.right - page.left) / k, b: (r.bottom - page.top) / k };
+      })
+      .filter(Boolean);
   };
+
+  // Moves fields by whole deltas: { id: { dx, dy } } in mm.
+  const moveFieldsBy = (deltas, key) =>
+    setFields((fs) => fs.map((f) => (deltas[f.id] ? { ...f, x_mm: round1(f.x_mm + (deltas[f.id].dx || 0)), y_mm: round1(f.y_mm + (deltas[f.id].dy || 0)) } : f)), key);
+
+  // One field: aligned to the page. Several: to the box around them.
+  const alignSelection = (how) => {
+    const rects = measureFields(selectedIds);
+    if (rects.length === 0) return;
+    const box =
+      rects.length === 1
+        ? { l: 0, t: 0, r: sideData.page.width_mm, b: sideData.page.height_mm }
+        : { l: Math.min(...rects.map((r) => r.l)), t: Math.min(...rects.map((r) => r.t)), r: Math.max(...rects.map((r) => r.r)), b: Math.max(...rects.map((r) => r.b)) };
+    const deltas = {};
+    for (const r of rects) {
+      if (how === "left") deltas[r.id] = { dx: box.l - r.l };
+      if (how === "hcenter") deltas[r.id] = { dx: (box.l + box.r) / 2 - (r.l + r.r) / 2 };
+      if (how === "right") deltas[r.id] = { dx: box.r - r.r };
+      if (how === "top") deltas[r.id] = { dy: box.t - r.t };
+      if (how === "vcenter") deltas[r.id] = { dy: (box.t + box.b) / 2 - (r.t + r.b) / 2 };
+      if (how === "bottom") deltas[r.id] = { dy: box.b - r.b };
+    }
+    moveFieldsBy(deltas);
+  };
+
+  // Equal gaps between three or more fields, keeping the outer two in place.
+  const distributeSelection = (axis) => {
+    const rects = measureFields(selectedIds);
+    if (rects.length < 3) return;
+    const [start, end] = axis === "h" ? ["l", "r"] : ["t", "b"];
+    const sorted = [...rects].sort((a, b) => a[start] - b[start]);
+    const span = sorted[sorted.length - 1][end] - sorted[0][start];
+    const total = sorted.reduce((sum, r) => sum + (r[end] - r[start]), 0);
+    const gap = (span - total) / (sorted.length - 1);
+    let cursor = sorted[0][start];
+    const deltas = {};
+    for (const r of sorted) {
+      deltas[r.id] = axis === "h" ? { dx: cursor - r[start] } : { dy: cursor - r[start] };
+      cursor += r[end] - r[start] + gap;
+    }
+    moveFieldsBy(deltas);
+  };
+
+  // ---------- page-level settings ----------
 
   // Global (not per-field): every schedule field shows the same
   // competition, so they all share one timezone. Empty string means
@@ -961,7 +1217,7 @@ export default function BadgeDesigner() {
         };
       }
       return next;
-    });
+    }, "timezone");
   };
   // Global like the timezone: renames and the MBLD submission task apply to
   // every schedule field. Same re-derivation as above, for the live preview.
@@ -972,7 +1228,7 @@ export default function BadgeDesigner() {
         next.sampleData = { ...prev.sampleData, schedules: buildGenericSchedule(prev.wcif, prev.scheduleTimezone || undefined, scheduleOptions(next)) };
       }
       return next;
-    });
+    }, `schedule:${Object.keys(patch).join()}`);
   // kind: "events" (keyed by event id) or "activities" (keyed by the
   // activity's WCIF name). Empty text drops the rename.
   const setScheduleLabel = (kind, key, text) => {
@@ -985,41 +1241,81 @@ export default function BadgeDesigner() {
   const scheduleTexts = state.wcif ? listScheduleTexts(state.wcif) : null;
   const detectedScheduleTimezone = state.wcif ? resolveScheduleTimezone(state.wcif) : null;
 
-  const round1 = (v) => Math.round(v * 10) / 10;
-  const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
+  // ---------- dragging, resizing, selection box, panning ----------
+
   const stateRef = useRef(state);
   stateRef.current = state;
   const sideRef = useRef(side);
   sideRef.current = side;
 
-  const startDrag = useCallback((e, field, mode) => {
+  // Applies { id: patch } to fields of the current side; no-op patches
+  // leave the document untouched (so a click doesn't create an undo step).
+  const applyFieldsPatch = (patches, key) =>
+    setState((s) => {
+      const sk = sideRef.current;
+      let changed = false;
+      const nextFields = s[sk].fields.map((f) => {
+        const p = patches[f.id];
+        if (!p || Object.keys(p).every((k) => f[k] === p[k])) return f;
+        changed = true;
+        return { ...f, ...p };
+      });
+      return changed ? { ...s, [sk]: { ...s[sk], fields: nextFields } } : s;
+    }, key);
+
+  const startDrag = (e, field, mode) => {
+    if (spaceDown || e.button !== 0) return; // let the viewport pan instead
     e.stopPropagation();
     e.preventDefault();
-    setSelectedId(field.id);
-    dragRef.current = { id: field.id, mode, type: field.type, startX: e.clientX, startY: e.clientY, origX: field.x_mm, origY: field.y_mm, origW: fieldBoxWidthMm(field), origH: fieldBoxHeightMm(field) };
+    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    if (additive && mode === "move") {
+      setSelectedIds((ids) => (ids.includes(field.id) ? ids.filter((i) => i !== field.id) : [...ids, field.id]));
+      return;
+    }
+    // Dragging one of several selected fields moves them all; resizing is
+    // always one field.
+    const ids = mode === "move" && selectedIds.includes(field.id) ? selectedIds : [field.id];
+    if (ids.length === 1) setSelectedIds([field.id]);
+    const origins = {};
+    for (const f of fields) if (ids.includes(f.id)) origins[f.id] = { x: f.x_mm, y: f.y_mm };
+    dragRef.current = {
+      id: field.id,
+      ids,
+      origins,
+      mode,
+      type: field.type,
+      zoom,
+      gesture: `gesture:${uid(mode)}`, // one undo step for the whole drag
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: field.x_mm,
+      origY: field.y_mm,
+      origW: fieldBoxWidthMm(field),
+      origH: fieldBoxHeightMm(field),
+    };
     window.addEventListener("pointermove", onDragMove);
     window.addEventListener("pointerup", onDragEnd);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  };
 
   const onDragMove = (e) => {
     const d = dragRef.current;
     if (!d) return;
     const s = stateRef.current;
     const sd = s[sideRef.current];
-    const dx = (e.clientX - d.startX) / SCALE;
-    const dy = (e.clientY - d.startY) / SCALE;
+    const dx = (e.clientX - d.startX) / (SCALE * d.zoom);
+    const dy = (e.clientY - d.startY) / (SCALE * d.zoom);
     const pw = sd.page.width_mm;
     const ph = sd.page.height_mm;
     if (d.mode === "move") {
       const rawX = clamp(d.origX + dx, 0, Math.max(pw - d.origW, 0));
       const rawY = clamp(d.origY + dy, 0, Math.max(ph - d.origH, 0));
 
-      // Auto-alignment: snap to the page center or to other fields' edges/centers
+      // Auto-alignment: snap the grabbed field to the page center, the
+      // safe margin, or edges/centers of fields that aren't moving.
       const SNAP_TOL = 1.2; // mm
       const w = d.origW;
       const h = d.origH;
-      const others = sd.fields.filter((f) => f.id !== d.id);
+      const others = sd.fields.filter((f) => !d.ids.includes(f.id));
 
       // [position to snap to, where to draw the guide line]: alignment
       // snaps show the field's center line, safe-margin snaps the margin.
@@ -1063,16 +1359,21 @@ export default function BadgeDesigner() {
       }
 
       setGuides({ x: gx, y: gy });
-      applyFieldPatch(d.id, { x_mm: round1(nx), y_mm: round1(ny) });
+      const ddx = nx - d.origX;
+      const ddy = ny - d.origY;
+      const patches = {};
+      for (const id of d.ids) patches[id] = { x_mm: round1(d.origins[id].x + ddx), y_mm: round1(d.origins[id].y + ddy) };
+      applyFieldsPatch(patches, d.gesture);
     } else {
       const nw = clamp(d.origW + dx, MIN_MM, pw - d.origX);
       const dragged = sd.fields.find((f) => f.id === d.id);
+      const patch = (p) => applyFieldsPatch({ [d.id]: p }, d.gesture);
       if (dragged?.type === "text" && dragged.textKind === "frame") {
         const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
-        applyFieldPatch(d.id, { frame: { ...dragged.frame, w_mm: round1(nw), ...(dragged.frame.auto_height ? {} : { h_mm: round1(nh) }) } });
+        patch({ frame: { ...dragged.frame, w_mm: round1(nw), ...(dragged.frame.auto_height ? {} : { h_mm: round1(nh) }) } });
       } else if (d.type === "schedule" || d.type === "taskkey") {
         // Height is derived, not draggable — width only.
-        applyFieldPatch(d.id, { w_mm: round1(nw) });
+        patch({ w_mm: round1(nw) });
       } else if (d.type === "qr") {
         // QR codes must stay square — a single size_mm, not independent
         // width/height (see drawQrField in pdfExport.js, which only ever
@@ -1082,23 +1383,16 @@ export default function BadgeDesigner() {
         const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
         const newSize = Math.abs(nw - d.origW) >= Math.abs(nh - d.origH) ? nw : nh;
         const maxSize = Math.min(pw - d.origX, ph - d.origY);
-        applyFieldPatch(d.id, { size_mm: round1(clamp(newSize, MIN_MM, maxSize)) });
+        patch({ size_mm: round1(clamp(newSize, MIN_MM, maxSize)) });
       } else if (dragged?.type === "text") {
         // Wrapped point text: width, plus the box height when it has one.
         const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
-        applyFieldPatch(d.id, { w_mm: round1(nw), ...(dragged.boxHeightMm > 0 ? { boxHeightMm: round1(nh) } : {}) });
+        patch({ w_mm: round1(nw), ...(dragged.boxHeightMm > 0 ? { boxHeightMm: round1(nh) } : {}) });
       } else {
         const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
-        applyFieldPatch(d.id, { w_mm: round1(nw), h_mm: round1(nh) });
+        patch({ w_mm: round1(nw), h_mm: round1(nh) });
       }
     }
-  };
-
-  const applyFieldPatch = (id, patch) => {
-    setState((s) => {
-      const sd = s[sideRef.current];
-      return { ...s, [sideRef.current]: { ...sd, fields: sd.fields.map((f) => (f.id === id ? { ...f, ...patch } : f)) } };
-    });
   };
 
   const onDragEnd = () => {
@@ -1108,15 +1402,204 @@ export default function BadgeDesigner() {
     window.removeEventListener("pointerup", onDragEnd);
   };
 
+  // Space + drag, or the middle mouse button: scroll the view around.
+  const startPan = (e) => {
+    e.preventDefault();
+    const vp = viewportRef.current;
+    const start = { x: e.clientX, y: e.clientY, left: vp.scrollLeft, top: vp.scrollTop };
+    setPanning(true);
+    const move = (ev) => {
+      vp.scrollLeft = start.left - (ev.clientX - start.x);
+      vp.scrollTop = start.top - (ev.clientY - start.y);
+    };
+    const up = () => {
+      setPanning(false);
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  // Pressing on empty space (fields stop their own presses): a click
+  // deselects, a drag draws a selection box selecting every field it
+  // touches (added to the selection with Shift/Ctrl).
+  const onViewportPointerDown = (e) => {
+    if (e.button === 1 || spaceDown) {
+      startPan(e);
+      return;
+    }
+    if (e.button !== 0) return;
+    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    const base = additive ? selectedIds : [];
+    const start = { x: e.clientX, y: e.clientY };
+    let moved = false;
+    const move = (ev) => {
+      if (!moved && Math.hypot(ev.clientX - start.x, ev.clientY - start.y) < 4) return;
+      moved = true;
+      const r = { left: Math.min(start.x, ev.clientX), top: Math.min(start.y, ev.clientY), right: Math.max(start.x, ev.clientX), bottom: Math.max(start.y, ev.clientY) };
+      setMarquee(r);
+      const hit = [...(canvasRef.current?.querySelectorAll("[data-field-id]") || [])]
+        .filter((el) => {
+          const b = el.getBoundingClientRect();
+          return b.right >= r.left && b.left <= r.right && b.bottom >= r.top && b.top <= r.bottom;
+        })
+        .map((el) => el.dataset.fieldId);
+      setSelectedIds([...new Set([...base, ...hit])]);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      setMarquee(null);
+      if (!moved && !additive) setSelectedIds([]);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  // ---------- zoom ----------
+
+  const fitZoom = () => {
+    const vp = viewportRef.current;
+    if (!vp) return 1;
+    const w = sideData.page.width_mm * SCALE;
+    const h = sideData.page.height_mm * SCALE;
+    return Math.max(0.05, Math.min((vp.clientWidth - 2 * VIEWPORT_PAD) / w, (vp.clientHeight - 2 * VIEWPORT_PAD) / h));
+  };
+  // anchor: a client point that should stay still on screen (pointer zoom).
+  const zoomTo = (next, anchor) => {
+    const z = clamp(next, pctToZoom(5), pctToZoom(1000));
+    if (anchor && canvasRef.current) {
+      const page = canvasRef.current.getBoundingClientRect();
+      zoomAnchorRef.current = { clientX: anchor.x, clientY: anchor.y, pageX: (anchor.x - page.left) / zoom, pageY: (anchor.y - page.top) / zoom };
+    }
+    setZoom(z);
+  };
+  const zoomStep = (dir, anchor) => {
+    const pct = zoomToPct(zoom);
+    const nextPct = dir > 0 ? ZOOM_STEPS_PCT.find((p) => p > pct + 0.5) ?? ZOOM_STEPS_PCT.at(-1) : [...ZOOM_STEPS_PCT].reverse().find((p) => p < pct - 0.5) ?? ZOOM_STEPS_PCT[0];
+    zoomTo(pctToZoom(nextPct), anchor);
+  };
+
+  // After a pointer-anchored zoom, scroll so that point is back under the pointer.
+  useLayoutEffect(() => {
+    const a = zoomAnchorRef.current;
+    if (!a || !canvasRef.current || !viewportRef.current) return;
+    zoomAnchorRef.current = null;
+    const page = canvasRef.current.getBoundingClientRect();
+    viewportRef.current.scrollLeft += page.left + a.pageX * zoom - a.clientX;
+    viewportRef.current.scrollTop += page.top + a.pageY * zoom - a.clientY;
+  }, [zoom]);
+
+  // Fit the page to the window when the editor opens, and whenever the
+  // page shown changes size (other side, new page size).
+  const pageW = sideData.page.width_mm;
+  const pageH = sideData.page.height_mm;
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      const vp = viewportRef.current;
+      if (!vp) return;
+      setZoom(Math.max(0.05, Math.min((vp.clientWidth - 2 * VIEWPORT_PAD) / (pageW * SCALE), (vp.clientHeight - 2 * VIEWPORT_PAD) / (pageH * SCALE))));
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [side, pageW, pageH]);
+
+  // Ctrl/⌘ + wheel zooms at the pointer (instead of zooming the browser).
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const onWheel = (e) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      zoomTo(zoom * Math.exp(-e.deltaY * 0.0015), { x: e.clientX, y: e.clientY });
+    };
+    vp.addEventListener("wheel", onWheel, { passive: false });
+    return () => vp.removeEventListener("wheel", onWheel);
+  });
+
+  // ---------- keyboard ----------
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const mod = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+      const typing = isTypingTarget(e.target);
+      const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+      // Layer order: Ctrl+] / Ctrl+[ (by key, or by physical key for
+      // keyboards where brackets need AltGr), or Ctrl+↑ / Ctrl+↓.
+      const forward = e.key === "]" || e.key === "}" || e.code === "BracketRight" || e.key === "ArrowUp";
+      const backward = e.key === "[" || e.key === "{" || e.code === "BracketLeft" || e.key === "ArrowDown";
+
+      // [condition, action]: the first match runs, and the browser's own
+      // handling of that key is cancelled.
+      const shortcuts = [
+        // These would otherwise zoom, save or open in the browser itself,
+        // so they work even while typing in a box.
+        [mod && (e.key === "+" || e.key === "="), () => zoomStep(1)],
+        [mod && (e.key === "-" || e.key === "_"), () => zoomStep(-1)],
+        [mod && e.key === "0", () => setZoom(fitZoom())],
+        [mod && e.key === "1", () => zoomTo(pctToZoom(100))],
+        [mod && key === "s", exportTemplate],
+        [mod && key === "o", () => importInputRef.current?.click()],
+        // From here on, only outside text boxes: there, copy, undo, arrows…
+        // belong to the box.
+        [!typing && e.key === " ", () => setSpaceDown(true)],
+        [!typing && mod && key === "z", () => (e.shiftKey ? redo() : undo())],
+        [!typing && mod && key === "y", redo],
+        [!typing && mod && key === "a", () => setSelectedIds(fields.map((f) => f.id))],
+        [!typing && mod && key === "d", duplicateSelection],
+        [!typing && mod && (forward || backward), () => reorderSelection(forward ? (e.shiftKey ? "front" : "forward") : e.shiftKey ? "back" : "backward")],
+        [!typing && (e.key === "Delete" || e.key === "Backspace") && selectedIds.length > 0, deleteSelection],
+        [
+          !typing && !mod && arrows[e.key] && selectedIds.length > 0,
+          () => {
+            const stepMm = e.shiftKey ? 10 : 1;
+            const [ax, ay] = arrows[e.key];
+            moveFieldsBy(Object.fromEntries(selectedIds.map((id) => [id, { dx: ax * stepMm, dy: ay * stepMm }])), "nudge");
+          },
+        ],
+        [!typing && (e.key === "?" || (mod && e.key === "/")), () => setShowShortcuts((v) => !v)],
+      ];
+
+      if (e.key === "Escape") {
+        if (showShortcuts || showAbout) {
+          setShowShortcuts(false);
+          setShowAbout(false);
+        } else if (!typing) setSelectedIds([]);
+        return;
+      }
+      const match = shortcuts.find(([when]) => when);
+      if (match) {
+        e.preventDefault();
+        match[1]();
+      }
+    };
+    const onKeyUp = (e) => {
+      if (e.key === " ") setSpaceDown(false);
+    };
+    const onBlur = () => setSpaceDown(false);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  });
+
+  // ---------- assets, templates, PDF ----------
+
   const onBgUpload = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => updateSide({ background: reader.result });
+    reader.onload = () => updateSide({ background: reader.result, backgroundName: `assets/${file.name}` });
     reader.readAsDataURL(file);
+    e.target.value = "";
   };
 
-  const updateSampleValue = (key, value) => setState((s) => ({ ...s, sampleData: { ...s.sampleData, [key]: value } }));
+  const updateSampleValue = (key, value) => setState((s) => ({ ...s, sampleData: { ...s.sampleData, [key]: value } }), `sample:${key}`);
   const addSampleKey = () => {
     const key = prompt("New data field name (e.g. team, gender):");
     if (key && !(key in state.sampleData)) setState((s) => ({ ...s, sampleData: { ...s.sampleData, [key]: "" } }));
@@ -1145,7 +1628,7 @@ export default function BadgeDesigner() {
     };
     reader.readAsDataURL(file);
   };
-  const renameFontDisplay = (id, displayName) => setState((s) => ({ ...s, fonts: s.fonts.map((f) => (f.id === id ? { ...f, displayName } : f)) }));
+  const renameFontDisplay = (id, displayName) => setState((s) => ({ ...s, fonts: s.fonts.map((f) => (f.id === id ? { ...f, displayName } : f)) }), `fontname:${id}`);
   const removeFont = (id) => setState((s) => ({ ...s, fonts: s.fonts.filter((f) => f.id !== id) }));
 
   const [addingGoogleFont, setAddingGoogleFont] = useState(null); // preset.label currently being fetched, or null
@@ -1280,7 +1763,8 @@ export default function BadgeDesigner() {
 
   const generateAllBadges = async () => {
     if (!state.wcif) {
-      alert('Load a competition WCIF first (the "Load WCIF JSON" control) — the PDF is built from real competitors, not the sample preview data.');
+      setActiveTab("competition");
+      alert("Load a competition first (Competition tab) — the PDF is built from real competitors, not the sample preview data.");
       return;
     }
     setGenerating({ done: 0, total: 0 });
@@ -1319,7 +1803,7 @@ export default function BadgeDesigner() {
         }
 
         setState(next);
-        setSelectedId(null);
+        setSelectedIds([]);
         setSide("front");
 
         const missingFonts = next.fonts.some((f) => f.needsReupload);
@@ -1344,326 +1828,557 @@ export default function BadgeDesigner() {
   const bgMapEnabled = sideData.backgroundMap?.enabled;
   const bgMapMatch = bgMapEnabled ? resolveMapping(sideData.backgroundMap, state.sampleData, "image") : null;
   const bgMapSrc = bgMapEnabled ? (bgMapMatch ? bgMapMatch.preview : sideData.backgroundMap.fallbackPreview) : null;
+  const personCount = state.wcif ? badgeablePersons(state.wcif).length : 0;
+
+  const iconButton = "p-1.5 rounded-md text-neutral-600 hover:bg-neutral-100 disabled:opacity-30 disabled:hover:bg-transparent";
 
   return (
-    <div className="w-full bg-neutral-100 text-neutral-900 flex flex-col" style={{ fontFamily: "system-ui, sans-serif", minHeight: 720 }}>
-      <div className="flex flex-wrap items-center gap-3 px-5 py-3 bg-white border-b border-neutral-200">
-        <div className="flex rounded-md overflow-hidden border border-neutral-300">
+    <div className="w-full h-screen bg-neutral-100 text-neutral-900 flex flex-col overflow-hidden" style={{ fontFamily: "system-ui, sans-serif" }}>
+      {/* ---------- top bar ---------- */}
+      <div className="h-12 shrink-0 flex items-center gap-2 px-3 bg-white border-b border-neutral-200">
+        <button onClick={() => setShowAbout(true)} className="flex items-center gap-1.5 pr-2 mr-1 border-r border-neutral-200 font-semibold text-sm hover:text-blue-700" title="About and credits">
+          <BadgeCheck size={18} className="text-blue-600" />
+          <span className="hidden md:inline">Badge Designer</span>
+        </button>
+        <button onClick={undo} disabled={!canUndo} className={iconButton} title="Undo (Ctrl+Z)">
+          <Undo2 size={16} />
+        </button>
+        <button onClick={redo} disabled={!canRedo} className={iconButton} title="Redo (Ctrl+Shift+Z)">
+          <Redo2 size={16} />
+        </button>
+        <div className="w-px h-6 bg-neutral-200 mx-1" />
+        <div className="flex rounded-md overflow-hidden border border-neutral-300 text-sm">
           {["front", "back"].map((s) => (
             <button
               key={s}
               onClick={() => {
                 setSide(s);
-                setSelectedId(null);
+                setSelectedIds([]);
               }}
-              className={`px-4 py-1.5 text-sm font-medium capitalize ${side === s ? "bg-neutral-900 text-white" : "bg-white text-neutral-600 hover:bg-neutral-50"}`}
+              className={`px-3 py-1 font-medium capitalize ${side === s ? "bg-neutral-900 text-white" : "bg-white text-neutral-600 hover:bg-neutral-50"}`}
             >
               {s}
             </button>
           ))}
         </div>
 
-        <select onChange={(e) => applyPreset(PAGE_PRESETS[Number(e.target.value)])} className="text-xs px-2 py-1.5 border border-neutral-300 rounded-md text-neutral-700" defaultValue="">
-          <option value="" disabled>
-            Page size preset…
-          </option>
-          {PAGE_PRESETS.map((p, i) => (
-            <option key={p.label} value={i}>
-              {p.label}
+        {/* page of the side shown: size and safe margin */}
+        <div className="hidden md:flex items-center gap-1.5 text-xs text-neutral-500 ml-1">
+          <select
+            onChange={(e) => applyPreset(PAGE_PRESETS[Number(e.target.value)])}
+            value={String(PAGE_PRESETS.findIndex((p) => p.w === sideData.page.width_mm && p.h === sideData.page.height_mm))}
+            className="text-xs px-1.5 py-1 border border-neutral-300 rounded-md text-neutral-700 max-w-40"
+            title="Page size"
+          >
+            <option value="-1" disabled>
+              Custom size
             </option>
-          ))}
-        </select>
-
-        <div className="flex items-center gap-1.5 text-xs text-neutral-500">
-          <input type="number" value={sideData.page.width_mm} onChange={(e) => updateSide({ page: { ...sideData.page, width_mm: Number(e.target.value) } })} className="w-14 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" />
+            {PAGE_PRESETS.filter((p) => p.w != null).map((p) => (
+              <option key={p.label} value={PAGE_PRESETS.indexOf(p)}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+          <input type="number" step="0.5" value={sideData.page.width_mm} onChange={(e) => updateSide({ page: { ...sideData.page, width_mm: Number(e.target.value) } }, `page:${side}:w`)} className="w-14 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" title="Width (mm)" />
           <span>×</span>
-          <input type="number" value={sideData.page.height_mm} onChange={(e) => updateSide({ page: { ...sideData.page, height_mm: Number(e.target.value) } })} className="w-14 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" />
+          <input type="number" step="0.5" value={sideData.page.height_mm} onChange={(e) => updateSide({ page: { ...sideData.page, height_mm: Number(e.target.value) } }, `page:${side}:h`)} className="w-14 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" title="Height (mm)" />
           <span>mm</span>
+          <span className="ml-2" title="Safe margin: a guide drawn this far inside every edge while designing. Not printed.">
+            Margin
+          </span>
+          <input
+            type="number"
+            min={0}
+            step={0.5}
+            value={sideData.safeMarginMm}
+            onChange={(e) => updateSide({ safeMarginMm: clamp(Number(e.target.value) || 0, 0, Math.min(sideData.page.width_mm, sideData.page.height_mm) / 2) }, `margin:${side}`)}
+            className="w-12 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800"
+            title="Safe margin (mm) — guide only, not printed"
+          />
         </div>
-
-        <label className="flex items-center gap-1.5 text-xs text-neutral-500" title="Safe margin: a guide drawn this far inside every edge while designing. Not printed.">
-          <span>Margin</span>
-          <input type="number" min={0} step={0.5} value={sideData.safeMarginMm} onChange={(e) => updateSide({ safeMarginMm: clamp(Number(e.target.value) || 0, 0, Math.min(sideData.page.width_mm, sideData.page.height_mm) / 2) })} className="w-12 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" />
-          <span>mm</span>
-        </label>
-
-        <label className="flex items-center gap-1.5 text-sm px-3 py-1.5 border border-neutral-300 rounded-md cursor-pointer hover:bg-neutral-50">
-          <Upload size={14} />
-          Background
-          <input type="file" accept="image/*" className="hidden" onChange={onBgUpload} />
-        </label>
-
-        <label className="flex items-center gap-1.5 text-xs text-neutral-600">
-          <input type="checkbox" checked={sideData.tint.enabled} onChange={(e) => updateTint({ enabled: e.target.checked })} />
-          Tint background
-        </label>
-        <button onClick={() => setSelectedId(TINT_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === TINT_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
-          <Droplet size={12} /> Tint colors
-        </button>
-
-        <button onClick={() => setSelectedId(BGMAP_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === BGMAP_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
-          <ImageIcon size={12} /> Background images
-        </button>
-
-        <button onClick={() => setSelectedId(FONTS_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === FONTS_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
-          <Type size={12} /> Fonts
-        </button>
-
-        <button onClick={() => setSelectedId(ROLEMAP_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === ROLEMAP_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
-          <Users size={12} /> Role mapping
-        </button>
-
-        <button onClick={() => setSelectedId(STAGECOLORS_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === STAGECOLORS_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
-          <SwatchBook size={12} /> Stage colors
-        </button>
-
-        <button onClick={() => setSelectedId(SCHEDULE_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === SCHEDULE_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
-          <Rows3 size={12} /> Schedule
-        </button>
 
         <div className="flex-1" />
 
-        <button onClick={() => setShowData((v) => !v)} className="flex items-center gap-1.5 text-sm px-3 py-1.5 border border-neutral-300 rounded-md hover:bg-neutral-50">
-          <Palette size={14} />
-          Sample data
+        <div className="relative">
+          <button
+            onClick={() => setShowCompMenu((v) => !v)}
+            className={`hidden sm:flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-md max-w-64 ${state.wcif ? "bg-emerald-50 text-emerald-800 hover:bg-emerald-100" : "bg-amber-50 text-amber-800 hover:bg-amber-100"}`}
+            title={state.wcif ? "Competition loaded — click to load another" : "Load a competition"}
+          >
+            <Trophy size={13} className="shrink-0" />
+            <span className="truncate">{state.wcif ? `${state.wcif.name || state.wcif.id} · ${personCount} people` : "Load competition"}</span>
+            <ChevronDown size={13} className="shrink-0" />
+          </button>
+          {showCompMenu && (
+            <CompetitionMenu
+              loaded={state.wcif}
+              onLoadId={async (id) => {
+                if (await loadWcifData(id)) setShowCompMenu(false);
+              }}
+              onOpenFile={async (file) => {
+                if (await loadWcifData(file)) setShowCompMenu(false);
+              }}
+              onManage={() => {
+                setActiveTab("competition");
+                setShowCompMenu(false);
+              }}
+              onClose={() => setShowCompMenu(false)}
+            />
+          )}
+        </div>
+
+        <button onClick={() => importInputRef.current?.click()} className={`${iconButton} flex items-center gap-1.5 text-sm px-2.5`} title="Open template (Ctrl+O)">
+          <FolderOpen size={15} /> <span className="hidden lg:inline">Open</span>
         </button>
-
-        <label className="flex items-center gap-1.5 text-sm px-3 py-1.5 border border-neutral-300 rounded-md cursor-pointer hover:bg-neutral-50">
-          <FileUp size={14} />
-          Import
-          <input
-            type="file"
-            accept="application/json,.json"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) importTemplate(file);
-              e.target.value = "";
-            }}
-          />
-        </label>
-
-        <label className="flex items-center gap-1.5 text-sm px-3 py-1.5 border border-blue-400 bg-blue-50 text-blue-700 rounded-md cursor-pointer hover:bg-blue-100">
-          <FileUp size={14} />
-          Load WCIF JSON
-          <input
-            type="file"
-            accept="application/json,.json"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) loadWcifData(file);
-              e.target.value = "";
-            }}
-          />
-        </label>
-
-        <button onClick={exportTemplate} className="flex items-center gap-1.5 text-sm font-medium px-3.5 py-1.5 bg-neutral-900 text-white rounded-md hover:bg-neutral-800">
-          <Download size={14} />
-          Export template.json
+        <input
+          ref={importInputRef}
+          type="file"
+          accept="application/json,.json"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) importTemplate(file);
+            e.target.value = "";
+          }}
+        />
+        <button onClick={exportTemplate} className={`${iconButton} flex items-center gap-1.5 text-sm px-2.5`} title="Save template.json (Ctrl+S)">
+          <Save size={15} /> <span className="hidden lg:inline">Save</span>
         </button>
-
         <button
           onClick={generateAllBadges}
           disabled={!!generating}
-          title={state.wcif ? `Generate badges for everyone in ${state.wcif.name || state.wcif.id}` : "Load a WCIF first"}
+          title={state.wcif ? `Generate badges for everyone in ${state.wcif.name || state.wcif.id}` : "Load a competition first"}
           className="flex items-center gap-1.5 text-sm font-medium px-3.5 py-1.5 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
         >
           <Printer size={14} />
-          {generating ? (generating.total ? `Generating ${generating.done}/${generating.total}…` : "Starting…") : "Generate PDF for all competitors"}
+          {generating ? (generating.total ? `Generating ${generating.done}/${generating.total}…` : "Starting…") : "Generate PDF"}
         </button>
       </div>
 
-      <div className="flex flex-1 overflow-hidden">
-        <div className="flex-1 flex items-center justify-center p-8 overflow-auto">
-          <div ref={canvasRef} onPointerDown={() => setSelectedId(null)} style={{ width: pw, height: ph, backgroundColor: "#ffffff", position: "relative" }} className="shadow-lg border border-neutral-300 rounded-sm overflow-hidden">
-            {bgMapEnabled ? (
-              bgMapSrc && <img src={bgMapSrc} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }} />
-            ) : (
-              sideData.background && (
-                <>
-                  <img src={sideData.background} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", filter: sideData.tint.enabled ? "grayscale(1)" : "none" }} />
-                  {sideData.tint.enabled && <div style={{ position: "absolute", inset: 0, background: tintColor, mixBlendMode: "multiply" }} />}
-                </>
-              )
-            )}
-            {fields.map((f) => (
-              <FieldBox key={f.id} field={f} scale={SCALE} selected={selectedId === f.id} outsideMargin={outsideIds.includes(f.id)} sampleData={state.sampleData} onPointerDownMove={(e) => startDrag(e, f, "move")} onPointerDownResize={(e) => startDrag(e, f, "resize")} />
-            ))}
-            {sideData.safeMarginMm > 0 && (
-              <div
-                style={{
-                  position: "absolute",
-                  inset: sideData.safeMarginMm * SCALE,
-                  border: "1px dashed rgba(236, 72, 153, 0.8)",
-                  pointerEvents: "none",
-                }}
-              />
-            )}
-            {guides.x !== null && (
-              <div style={{ position: "absolute", left: guides.x * SCALE, top: 0, bottom: 0, width: 1, background: "#2563eb", pointerEvents: "none" }} />
-            )}
-            {guides.y !== null && (
-              <div style={{ position: "absolute", top: guides.y * SCALE, left: 0, right: 0, height: 1, background: "#2563eb", pointerEvents: "none" }} />
-            )}
+      <div className="flex flex-1 min-h-0">
+        {/* ---------- left rail + panel ---------- */}
+        <div className="w-16 shrink-0 bg-white border-r border-neutral-200 flex flex-col items-stretch py-2 gap-1">
+          {LEFT_TABS.map((t) => {
+            const Icon = t.icon;
+            const active = activeTab === t.id;
+            return (
+              <button
+                key={t.id}
+                onClick={() => setActiveTab(active ? null : t.id)}
+                className={`mx-1.5 flex flex-col items-center gap-1 py-2 rounded-lg text-[10px] ${active ? "bg-blue-50 text-blue-700" : "text-neutral-500 hover:bg-neutral-100 hover:text-neutral-800"}`}
+              >
+                <Icon size={19} />
+                {t.label}
+              </button>
+            );
+          })}
+          <div className="flex-1" />
+          <button onClick={() => setShowShortcuts(true)} className="mx-1.5 flex flex-col items-center gap-1 py-2 rounded-lg text-[10px] text-neutral-500 hover:bg-neutral-100 hover:text-neutral-800" title="Keyboard shortcuts (?)">
+            <Keyboard size={19} />
+            Shortcuts
+          </button>
+        </div>
+
+        {activeTab && (
+          <div className="w-80 shrink-0 bg-white border-r border-neutral-200 flex flex-col min-h-0">
+            <div className="h-11 shrink-0 flex items-center justify-between px-4 border-b border-neutral-100">
+              <div className="text-sm font-semibold">{LEFT_TABS.find((t) => t.id === activeTab)?.label}</div>
+              <button onClick={() => setActiveTab(null)} className="text-neutral-400 hover:text-neutral-700" title="Close panel">
+                <PanelLeftClose size={16} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {activeTab === "elements" && (
+                <div className="p-4 space-y-4">
+                  <div className="grid grid-cols-2 gap-2">
+                    {Object.entries(TYPE_META).map(([type, meta]) => {
+                      const Icon = meta.icon;
+                      return (
+                        <button
+                          key={type}
+                          onClick={() => (type === "schedule" ? handleAddSchedule() : addField(type))}
+                          className="flex flex-col items-center justify-center gap-2 h-20 rounded-lg border border-neutral-200 bg-neutral-50 hover:bg-blue-50 hover:border-blue-300 hover:text-blue-700 text-xs text-neutral-700"
+                        >
+                          <Icon size={22} />
+                          {meta.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="text-[11px] text-neutral-400 leading-relaxed">
+                    Tip: paste an image or some text copied from anywhere (Ctrl+V) to drop it straight onto the badge. Press <kbd className="px-1 border border-neutral-300 rounded">?</kbd> for all shortcuts.
+                  </div>
+                </div>
+              )}
+
+              {activeTab === "layers" && (
+                <div className="p-3">
+                  <div className="text-[11px] text-neutral-400 mb-2 px-1">Top is frontmost. Drag to reorder; Shift/Ctrl+click to select several.</div>
+                  <div className="space-y-0.5">
+                    {[...fields].reverse().map((f) => {
+                      const Icon = TYPE_META[f.type].icon;
+                      const isSelected = selectedIds.includes(f.id);
+                      return (
+                        <div
+                          key={f.id}
+                          draggable
+                          onDragStart={(e) => {
+                            e.dataTransfer.effectAllowed = "move";
+                            setDraggingFieldId(f.id);
+                          }}
+                          onDragOver={(e) => {
+                            e.preventDefault();
+                            e.dataTransfer.dropEffect = "move";
+                          }}
+                          onDrop={(e) => {
+                            e.preventDefault();
+                            if (draggingFieldId) reorderFields(draggingFieldId, f.id);
+                            setDraggingFieldId(null);
+                          }}
+                          onDragEnd={() => setDraggingFieldId(null)}
+                          onClick={(e) => {
+                            if (e.shiftKey || e.ctrlKey || e.metaKey) setSelectedIds((ids) => (ids.includes(f.id) ? ids.filter((i) => i !== f.id) : [...ids, f.id]));
+                            else setSelectedIds([f.id]);
+                          }}
+                          className={`group flex items-center gap-1.5 px-2 py-1.5 rounded-md text-sm cursor-pointer select-none ${isSelected ? "bg-blue-50 text-blue-700" : "hover:bg-neutral-50 text-neutral-700"} ${draggingFieldId === f.id ? "opacity-40" : ""}`}
+                        >
+                          <GripVertical size={13} className="text-neutral-300 cursor-grab shrink-0" />
+                          <Icon size={14} className="shrink-0" />
+                          <span className="flex-1 truncate">{fieldDisplayName(f)}</span>
+                          {outsideIds.includes(f.id) && (
+                            <span title="Goes past the safe margin — it may get cut off when printing" className="text-amber-500 shrink-0">
+                              <TriangleAlert size={13} />
+                            </span>
+                          )}
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setFields((fs) => fs.filter((x) => x.id !== f.id));
+                            }}
+                            className="text-neutral-300 hover:text-red-500 shrink-0 opacity-0 group-hover:opacity-100"
+                            title="Delete"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      );
+                    })}
+                    {fields.length === 0 && <div className="text-xs text-neutral-400 px-1">No elements on the {side} yet — add some from Elements.</div>}
+                  </div>
+                </div>
+              )}
+
+              {activeTab === "competition" && (
+                <div>
+                  <div className="p-4 space-y-3">
+                    {state.wcif ? (
+                      <div className="rounded-lg bg-emerald-50 text-emerald-900 px-3 py-2 text-sm">
+                        <div className="font-medium">{state.wcif.name || state.wcif.id}</div>
+                        <div className="text-xs text-emerald-700">{personCount} people get a badge</div>
+                      </div>
+                    ) : (
+                      <div className="text-xs text-neutral-500">Load the competition's WCIF to preview its schedule and generate everyone's badges.</div>
+                    )}
+                    <label className="flex items-center justify-center gap-1.5 text-sm px-3 py-2 border border-blue-300 bg-blue-50 text-blue-700 rounded-md cursor-pointer hover:bg-blue-100">
+                      <FileUp size={14} />
+                      {state.wcif ? "Load another WCIF file" : "Load WCIF file"}
+                      <input
+                        type="file"
+                        accept="application/json,.json"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) loadWcifData(file);
+                          e.target.value = "";
+                        }}
+                      />
+                    </label>
+                    <form
+                      className="flex gap-1.5"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        if (compIdInput.trim()) loadWcifData(compIdInput.trim());
+                      }}
+                    >
+                      <input value={compIdInput} onChange={(e) => setCompIdInput(e.target.value)} placeholder="…or a WCA competition ID" className="flex-1 min-w-0 text-sm px-2 py-1.5 border border-neutral-300 rounded-md" />
+                      <button type="submit" className="text-sm px-3 py-1.5 border border-neutral-300 rounded-md hover:bg-neutral-50">
+                        Load
+                      </button>
+                    </form>
+                  </div>
+                  <RoleMappingPanel roleMapping={state.roleMapping} onChange={updateRoleMapping} persons={state.wcif ? badgeablePersons(state.wcif) : null} />
+                  <SchedulePanel
+                    texts={scheduleTexts}
+                    labels={state.scheduleLabels}
+                    onLabelChange={setScheduleLabel}
+                    mbldSubmission={state.mbldSubmission}
+                    onMbldChange={updateMbldSubmission}
+                    mergedRounds={state.mergedRounds}
+                    onMergedRoundsChange={(codes) => updateScheduleSettings({ mergedRounds: codes })}
+                  />
+                  <StageColorsPanel stages={state.sampleData.stages || []} stageColors={state.stageColors} onChange={setStageColor} />
+                </div>
+              )}
+
+              {activeTab === "background" && (
+                <div>
+                  <div className="p-4 space-y-2">
+                    <div className="text-xs text-neutral-500">Background of the {side}.</div>
+                    <div className="flex gap-2">
+                      <label className="flex-1 flex items-center justify-center gap-1.5 text-sm px-3 py-2 border border-neutral-300 rounded-md cursor-pointer hover:bg-neutral-50">
+                        <Upload size={14} />
+                        {sideData.background ? "Replace image" : "Upload image"}
+                        <input type="file" accept="image/*" className="hidden" onChange={onBgUpload} />
+                      </label>
+                      {sideData.background && (
+                        <button onClick={() => updateSide({ background: null })} className="text-sm px-3 py-2 border border-neutral-300 rounded-md hover:bg-neutral-50 text-neutral-600" title="Remove background">
+                          <Trash2 size={14} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <TintPanel tint={sideData.tint} sampleData={state.sampleData} onChange={updateTint} />
+                  <BackgroundMapPanel bgMap={sideData.backgroundMap} sampleData={state.sampleData} onChange={updateBackgroundMap} />
+                </div>
+              )}
+
+              {activeTab === "fonts" && (
+                <FontsPanel fonts={state.fonts} onUpload={uploadFont} onRename={renameFontDisplay} onRemove={removeFont} onAddGooglePreset={addGoogleFontPreset} addingGoogleFont={addingGoogleFont} />
+              )}
+
+              {activeTab === "data" && <DataPanel sampleData={state.sampleData} updateSampleValue={updateSampleValue} addSampleKey={addSampleKey} removeSampleKey={removeSampleKey} />}
+            </div>
+          </div>
+        )}
+
+        {/* ---------- canvas ---------- */}
+        <div className="flex-1 min-w-0 relative">
+          <div
+            ref={viewportRef}
+            onPointerDown={onViewportPointerDown}
+            className="absolute inset-0 overflow-auto"
+            style={{ cursor: panning ? "grabbing" : spaceDown ? "grab" : "default" }}
+          >
+            <div style={{ minWidth: "100%", minHeight: "100%", width: pw * zoom + 2 * VIEWPORT_PAD, height: ph * zoom + 2 * VIEWPORT_PAD, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <div style={{ width: pw * zoom, height: ph * zoom, flexShrink: 0 }}>
+                <div
+                  ref={canvasRef}
+                  style={{ width: pw, height: ph, backgroundColor: "#ffffff", position: "relative", transform: `scale(${zoom})`, transformOrigin: "top left", pointerEvents: spaceDown ? "none" : undefined }}
+                  className="shadow-lg ring-1 ring-neutral-300 overflow-hidden"
+                >
+                  {bgMapEnabled ? (
+                    bgMapSrc && <img src={bgMapSrc} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }} />
+                  ) : (
+                    sideData.background && (
+                      <>
+                        <img src={sideData.background} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", filter: sideData.tint.enabled ? "grayscale(1)" : "none" }} />
+                        {sideData.tint.enabled && <div style={{ position: "absolute", inset: 0, background: tintColor, mixBlendMode: "multiply" }} />}
+                      </>
+                    )
+                  )}
+                  {fields.map((f) => (
+                    <FieldBox
+                      key={f.id}
+                      field={f}
+                      scale={SCALE}
+                      selected={selectedIds.includes(f.id)}
+                      showHandles={selectedIds.length === 1 && selectedIds[0] === f.id}
+                      outsideMargin={outsideIds.includes(f.id)}
+                      sampleData={state.sampleData}
+                      onPointerDownMove={(e) => startDrag(e, f, "move")}
+                      onPointerDownResize={(e) => startDrag(e, f, "resize")}
+                    />
+                  ))}
+                  {sideData.safeMarginMm > 0 && (
+                    <div style={{ position: "absolute", inset: sideData.safeMarginMm * SCALE, border: "1px dashed rgba(236, 72, 153, 0.8)", pointerEvents: "none" }} />
+                  )}
+                  {guides.x !== null && <div style={{ position: "absolute", left: guides.x * SCALE, top: 0, bottom: 0, width: 1 / zoom, background: "#2563eb", pointerEvents: "none" }} />}
+                  {guides.y !== null && <div style={{ position: "absolute", top: guides.y * SCALE, left: 0, right: 0, height: 1 / zoom, background: "#2563eb", pointerEvents: "none" }} />}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {marquee && (
+            <div
+              style={{ position: "fixed", left: marquee.left, top: marquee.top, width: marquee.right - marquee.left, height: marquee.bottom - marquee.top, border: "1px solid #3b82f6", background: "rgba(59,130,246,0.08)", pointerEvents: "none", zIndex: 40 }}
+            />
+          )}
+
+          {/* zoom controls */}
+          <div className="absolute bottom-3 right-3 flex items-center gap-0.5 bg-white rounded-lg shadow-md border border-neutral-200 px-1 py-1 text-sm">
+            <button onClick={() => zoomStep(-1)} className={iconButton} title="Zoom out (Ctrl −)">
+              <ZoomOut size={15} />
+            </button>
+            <button onClick={() => zoomTo(pctToZoom(100))} className="w-14 text-center text-xs tabular-nums text-neutral-700 hover:bg-neutral-100 rounded py-1" title="Actual size (Ctrl 1)">
+              {Math.round(zoomToPct(zoom))}%
+            </button>
+            <button onClick={() => zoomStep(1)} className={iconButton} title="Zoom in (Ctrl +)">
+              <ZoomIn size={15} />
+            </button>
+            <div className="w-px h-5 bg-neutral-200 mx-0.5" />
+            <button onClick={() => setZoom(fitZoom())} className={iconButton} title="Fit to screen (Ctrl 0)">
+              <Maximize size={15} />
+            </button>
           </div>
         </div>
 
-        {showData ? (
-          <DataPanel sampleData={state.sampleData} updateSampleValue={updateSampleValue} addSampleKey={addSampleKey} removeSampleKey={removeSampleKey} onClose={() => setShowData(false)} />
-        ) : (
-          <div className="w-80 bg-white border-l border-neutral-200 flex flex-col overflow-y-auto">
-            <div className="p-4 border-b border-neutral-200">
-              <div className="text-xs font-semibold text-neutral-500 mb-2">ADD FIELD</div>
-              <div className="grid grid-cols-2 gap-2">
-                {Object.entries(TYPE_META).map(([type, meta]) => {
-                  const Icon = meta.icon;
-                  return (
-                    <button
-                      key={type}
-                      onClick={() => {
-                        if (type === "schedule") {
-                          handleAddSchedule();
-                        } else {
-                          addField(type);
-                        }
-                      }}
-                      className="flex items-center gap-1.5 text-xs px-2 py-1.5 border border-neutral-300 rounded-md hover:bg-neutral-50"
-                    >
-                      <Plus size={12} />
-                      <Icon size={13} />
-                      {meta.label}
+        {/* ---------- right: properties of the selection (hidden otherwise) ---------- */}
+        {selectedFields.length > 0 && (
+          <div className="w-80 shrink-0 bg-white border-l border-neutral-200 overflow-y-auto">
+            <div className="p-4 space-y-3 border-b border-neutral-200">
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-semibold text-neutral-500 uppercase">
+                  {selectedField ? TYPE_META[selectedField.type].label : `${selectedFields.length} elements`}
+                </div>
+                <div className="flex items-center gap-0.5">
+                  <button onClick={duplicateSelection} className={iconButton} title="Duplicate (Ctrl+D)">
+                    <CopyPlus size={15} />
+                  </button>
+                  <button onClick={deleteSelection} className={`${iconButton} hover:text-red-600`} title="Delete (Del)">
+                    <Trash2 size={15} />
+                  </button>
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-neutral-500 mb-1">{selectedFields.length === 1 ? "Align to page" : "Align"}</div>
+                <div className="flex items-center gap-0.5">
+                  {[
+                    ["left", AlignHorizontalJustifyStart, "Align left"],
+                    ["hcenter", AlignHorizontalJustifyCenter, "Align centers horizontally"],
+                    ["right", AlignHorizontalJustifyEnd, "Align right"],
+                    ["top", AlignVerticalJustifyStart, "Align top"],
+                    ["vcenter", AlignVerticalJustifyCenter, "Align centers vertically"],
+                    ["bottom", AlignVerticalJustifyEnd, "Align bottom"],
+                  ].map(([how, Icon, title]) => (
+                    <button key={how} onClick={() => alignSelection(how)} className={iconButton} title={title}>
+                      <Icon size={16} />
                     </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="p-4 border-b border-neutral-200 max-h-48 overflow-y-auto">
-              <div className="text-xs font-semibold text-neutral-500 mb-0.5">{side.toUpperCase()} FIELDS</div>
-              <div className="text-[10px] text-neutral-400 mb-2">Drag to reorder, or use the arrows — top is frontmost</div>
-              <div className="space-y-1">
-                {[...fields].reverse().map((f, displayIdx, displayArr) => {
-                  const Icon = TYPE_META[f.type].icon;
-                  const fieldLabel = f.type === "text" ? (f.bindMode === "static" ? `"${(f.staticText || "").slice(0, 16)}"` : f.bindMode === "template" ? f.template || "(template)" : f.source) : TYPE_META[f.type].label;
-                  return (
-                    <div
-                      key={f.id}
-                      draggable
-                      onDragStart={(e) => {
-                        e.dataTransfer.effectAllowed = "move";
-                        setDraggingFieldId(f.id);
-                      }}
-                      onDragOver={(e) => {
-                        e.preventDefault();
-                        e.dataTransfer.dropEffect = "move";
-                      }}
-                      onDrop={(e) => {
-                        e.preventDefault();
-                        if (draggingFieldId) reorderFields(draggingFieldId, f.id);
-                        setDraggingFieldId(null);
-                      }}
-                      onDragEnd={() => setDraggingFieldId(null)}
-                      onClick={() => setSelectedId(f.id)}
-                      className={`flex items-center gap-1.5 px-2 py-1.5 rounded-md text-sm cursor-pointer ${selectedId === f.id ? "bg-blue-50 text-blue-700" : "hover:bg-neutral-50 text-neutral-700"} ${draggingFieldId === f.id ? "opacity-40" : ""}`}
-                    >
-                      <GripVertical size={13} className="text-neutral-300 cursor-grab shrink-0" />
-                      <Icon size={14} className="shrink-0" />
-                      <span className="flex-1 truncate">{fieldLabel}</span>
-                      {outsideIds.includes(f.id) && (
-                        <span title="Goes past the safe margin — it may get cut off when printing" className="text-amber-500 shrink-0">
-                          <TriangleAlert size={13} />
-                        </span>
-                      )}
-                      <div className="flex flex-col shrink-0">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            moveFieldInList(f.id, -1);
-                          }}
-                          disabled={displayIdx === 0}
-                          className="text-neutral-400 hover:text-neutral-700 disabled:opacity-20 disabled:hover:text-neutral-400 leading-none"
-                          title="Bring forward"
-                        >
-                          <ChevronUp size={13} />
-                        </button>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            moveFieldInList(f.id, 1);
-                          }}
-                          disabled={displayIdx === displayArr.length - 1}
-                          className="text-neutral-400 hover:text-neutral-700 disabled:opacity-20 disabled:hover:text-neutral-400 leading-none"
-                          title="Send backward"
-                        >
-                          <ChevronDown size={13} />
-                        </button>
-                      </div>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          removeField(f.id);
-                        }}
-                        className="text-neutral-400 hover:text-red-500 shrink-0"
-                      >
-                        <Trash2 size={13} />
+                  ))}
+                  {selectedFields.length >= 3 && (
+                    <>
+                      <div className="w-px h-5 bg-neutral-200 mx-0.5" />
+                      <button onClick={() => distributeSelection("h")} className={iconButton} title="Distribute horizontally">
+                        <AlignHorizontalDistributeCenter size={16} />
                       </button>
-                    </div>
-                  );
-                })}
-                {fields.length === 0 && <div className="text-xs text-neutral-400">No fields yet.</div>}
+                      <button onClick={() => distributeSelection("v")} className={iconButton} title="Distribute vertically">
+                        <AlignVerticalDistributeCenter size={16} />
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-neutral-500 mb-1">Order</div>
+                <div className="flex items-center gap-0.5">
+                  <button onClick={() => reorderSelection("front")} className={iconButton} title="Bring to front (Ctrl+Shift+])">
+                    <BringToFront size={16} />
+                  </button>
+                  <button onClick={() => reorderSelection("forward")} className={iconButton} title="Bring forward (Ctrl+])">
+                    <ArrowUp size={16} />
+                  </button>
+                  <button onClick={() => reorderSelection("backward")} className={iconButton} title="Send backward (Ctrl+[)">
+                    <ArrowDown size={16} />
+                  </button>
+                  <button onClick={() => reorderSelection("back")} className={iconButton} title="Send to back (Ctrl+Shift+[)">
+                    <SendToBack size={16} />
+                  </button>
+                </div>
               </div>
             </div>
 
-            {selectedId === TINT_ID && <TintPanel tint={sideData.tint} sampleData={state.sampleData} onChange={updateTint} />}
-            {selectedId === BGMAP_ID && <BackgroundMapPanel bgMap={sideData.backgroundMap} sampleData={state.sampleData} onChange={updateBackgroundMap} />}
-            {selectedId === FONTS_ID && (
-              <FontsPanel
-                fonts={state.fonts}
-                onUpload={uploadFont}
-                onRename={renameFontDisplay}
-                onRemove={removeFont}
-                onAddGooglePreset={addGoogleFontPreset}
-                addingGoogleFont={addingGoogleFont}
-              />
-            )}
-            {selectedId === ROLEMAP_ID && <RoleMappingPanel roleMapping={state.roleMapping} onChange={updateRoleMapping} persons={state.wcif ? badgeablePersons(state.wcif) : null} />}
-            {selectedId === SCHEDULE_ID && (
-              <SchedulePanel
-                texts={scheduleTexts}
-                labels={state.scheduleLabels}
-                onLabelChange={setScheduleLabel}
-                mbldSubmission={state.mbldSubmission}
-                onMbldChange={updateMbldSubmission}
-                mergedRounds={state.mergedRounds}
-                onMergedRoundsChange={(codes) => updateScheduleSettings({ mergedRounds: codes })}
-              />
-            )}
-            {selectedId === STAGECOLORS_ID && <StageColorsPanel stages={state.sampleData.stages || []} stageColors={state.stageColors} onChange={setStageColor} />}
-            {selectedField && (
-              <PropertiesPanel
-                field={selectedField}
-                sampleData={state.sampleData}
-                fontOptions={allFontOptions}
-                fontLabel={fontLabel}
-                pageWidth={sideData.page.width_mm}
-                pageHeight={sideData.page.height_mm}
-                onChange={(patch) => updateField(selectedField.id, patch)}
-                scheduleTimezone={state.scheduleTimezone}
-                detectedScheduleTimezone={detectedScheduleTimezone}
-                onScheduleTimezoneChange={setScheduleTimezone}
-                onSyncCountryFlags={() => syncCountryFlagsForField(selectedField.id)}
-                hasWcif={!!state.wcif}
-              />
-            )}
+          {selectedField && (
+            <PropertiesPanel
+              field={selectedField}
+              sampleData={state.sampleData}
+              fontOptions={allFontOptions}
+              fontLabel={fontLabel}
+              pageWidth={sideData.page.width_mm}
+              pageHeight={sideData.page.height_mm}
+              onChange={(patch) => updateField(selectedField.id, patch)}
+              scheduleTimezone={state.scheduleTimezone}
+              detectedScheduleTimezone={detectedScheduleTimezone}
+              onScheduleTimezoneChange={setScheduleTimezone}
+              onSyncCountryFlags={() => syncCountryFlagsForField(selectedField.id)}
+              hasWcif={!!state.wcif}
+            />
+          )}
           </div>
         )}
       </div>
+
+      {showShortcuts && <ShortcutsDialog onClose={() => setShowShortcuts(false)} />}
+      {showAbout && <AboutDialog onClose={() => setShowAbout(false)} />}
     </div>
   );
 }
 
-function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointerDownMove, onPointerDownResize }) {
+// Top-bar menu for the competition: the public WCIF straight from the WCA
+// by competition ID, or a WCIF file (e.g. the full one downloaded from the
+// competition's admin pages).
+function CompetitionMenu({ loaded, onLoadId, onOpenFile, onManage, onClose }) {
+  const [id, setId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const run = async (fn) => {
+    setBusy(true);
+    try {
+      await fn();
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <div className="fixed inset-0 z-30" onPointerDown={onClose} />
+      <div className="absolute right-0 top-full mt-1.5 z-40 w-80 bg-white rounded-lg shadow-xl border border-neutral-200 p-3 space-y-3 text-sm">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (id.trim()) run(() => onLoadId(id.trim()));
+          }}
+        >
+          <div className="text-[11px] font-semibold text-neutral-500 mb-1">From the WCA website</div>
+          <div className="flex gap-1.5">
+            <input
+              autoFocus
+              value={id}
+              onChange={(e) => setId(e.target.value)}
+              placeholder="Competition ID, e.g. SpanishChampionship2026"
+              className="flex-1 min-w-0 text-sm px-2 py-1.5 border border-neutral-300 rounded-md"
+            />
+            <button type="submit" disabled={busy || !id.trim()} className="px-3 py-1.5 rounded-md bg-blue-600 text-white disabled:opacity-50">
+              {busy ? "…" : "Load"}
+            </button>
+          </div>
+          <div className="text-[10px] text-neutral-400 mt-1">The ID is the last part of the competition's address: worldcubeassociation.org/competitions/<b>ID</b>.</div>
+        </form>
+        <div>
+          <div className="text-[11px] font-semibold text-neutral-500 mb-1">From a file</div>
+          <label className="flex items-center justify-center gap-1.5 px-3 py-1.5 border border-neutral-300 rounded-md cursor-pointer hover:bg-neutral-50">
+            <FileUp size={14} /> Open WCIF file…
+            <input
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = "";
+                if (file) run(() => onOpenFile(file));
+              }}
+            />
+          </label>
+        </div>
+        {loaded && (
+          <button onClick={onManage} className="w-full text-left text-xs text-blue-600 hover:underline pt-2 border-t border-neutral-100">
+            Role mapping, schedule and stage colors for {loaded.name || loaded.id} →
+          </button>
+        )}
+      </div>
+    </>
+  );
+}
+
+function FieldBox({ field, scale, selected, showHandles, outsideMargin, sampleData, onPointerDownMove, onPointerDownResize }) {
   const w = fieldBoxWidthMm(field) * scale;
   const textWraps = field.type === "text" && field.wrap;
   const align = field.align || "left";
@@ -2048,7 +2763,7 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
   return (
     <div style={style} data-field-id={field.id} data-field-type={isTextFrame ? "textframe" : field.type} onPointerDown={onPointerDownMove}>
       {content}
-      {selected && (field.type !== "text" || textWraps || isTextFrame) && (
+      {showHandles && (field.type !== "text" || textWraps || isTextFrame) && (
         <div
           onPointerDown={onPointerDownResize}
           style={{ position: "absolute", right: -4, bottom: -4, width: 10, height: 10, background: "#2563eb", borderRadius: 2, cursor: field.type === "schedule" || field.type === "taskkey" || (isTextFrame && field.frame.auto_height) ? "ew-resize" : "nwse-resize" }}
@@ -3060,18 +3775,12 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
   );
 }
 
-function DataPanel({ sampleData, updateSampleValue, addSampleKey, removeSampleKey, onClose }) {
+function DataPanel({ sampleData, updateSampleValue, addSampleKey, removeSampleKey }) {
   return (
-    <div className="w-80 bg-white border-l border-neutral-200 overflow-y-auto">
-      <div className="flex items-center justify-between p-4 border-b border-neutral-200">
-        <div className="text-sm font-semibold">Preview data</div>
-        <button onClick={onClose} className="text-neutral-400 hover:text-neutral-700">
-          <X size={16} />
-        </button>
-      </div>
+    <div>
       <div className="p-4">
         <div className="text-xs font-semibold text-neutral-500 mb-2">SAMPLE BADGE DATA</div>
-        <div className="text-[11px] text-neutral-400 mb-2">Used to preview this one badge. Color/image mappings, text value-mappings and templates live on each field — select a field to edit. Fonts live under the "Fonts" toolbar button.</div>
+        <div className="text-[11px] text-neutral-400 mb-2">Used to preview this one badge. Color/image mappings, text value-mappings and templates live on each element — select one to edit it.</div>
         <div className="space-y-2">
           {Object.entries(sampleData).map(([k, v]) => (
             <div key={k} className="flex items-center gap-1.5">
