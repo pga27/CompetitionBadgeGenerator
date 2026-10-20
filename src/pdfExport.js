@@ -4,6 +4,7 @@ import QRCode from "qrcode";
 import { buildCompetitorSchedules, buildStageList } from "./schedule.js";
 import { applyTextCase, layoutTextFrame } from "./textLayout.js";
 import { isFullCrop, placeImage } from "./imageCrop.js";
+import { personRole as matchPersonRole } from "./roles.js";
 
 const MM_TO_PT = 2.834645669;
 const mmv = (v) => v * MM_TO_PT;
@@ -356,7 +357,11 @@ function drawTextField(page, field, ctx, fonts, originX, originY) {
   const isBold = (field.font || "").includes("Bold");
   const isCustom = fonts.custom[field.font];
   const preferredFont = isCustom || (isBold ? fonts.helveticaBold : fonts.helvetica);
-  const color = hexToRgb01(field.color || "#000000");
+  // Same rule as resolveTextColor in BadgeDesigner.jsx.
+  const colorMap = field.colorMap;
+  const color = hexToRgb01(
+    (colorMap?.enabled ? resolveMappingColor({ mapSource: colorMap.source, mappings: colorMap.mappings, fallbackColor: field.color }, ctx) : field.color) || "#000000"
+  );
   const align = field.align || "left";
   const letterSpacing = field.letterSpacing || field.letter_spacing || 0;
 
@@ -1082,7 +1087,9 @@ async function drawBackground(page, sideTpl, ctx, pdfDoc, pageWMm, pageHMm, imag
 // array — first match wins, since a person can hold more than one role
 // at once and priority between them is a real choice (e.g. an organizer
 // who is also judging should probably badge as "organizer"). A person
-// matching no rule gets `fallback`. DEFAULT_ROLE_MAPPING below
+// matching no rule gets `fallback`. A rule can also name several roles
+// joined with "+" (e.g. "delegate+organizer"), matching people who have
+// all of them — see roles.js. DEFAULT_ROLE_MAPPING below
 // reproduces the old hardcoded behavior exactly, so existing
 // state/templates saved before this feature existed keep working
 // unchanged.
@@ -1095,12 +1102,7 @@ const DEFAULT_ROLE_MAPPING = {
 };
 
 function personRole(person, roleMapping) {
-  const roles = person.roles || [];
-  const mapping = roleMapping && roleMapping.rules ? roleMapping : DEFAULT_ROLE_MAPPING;
-  for (const rule of mapping.rules) {
-    if (rule.wcaRole && roles.includes(rule.wcaRole)) return rule.label || rule.wcaRole;
-  }
-  return mapping.fallback || "competitor";
+  return matchPersonRole(person, roleMapping && roleMapping.rules ? roleMapping : DEFAULT_ROLE_MAPPING);
 }
 
 function buildPersonContext(person, sampleData, competitorSchedules, stages, roleMapping) {

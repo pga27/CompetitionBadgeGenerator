@@ -32,6 +32,7 @@ import { generateBadgesPdf, downloadPdfBytes } from "./pdfExport.js";
 import defaultTemplate from "./defaultTemplate.json";
 import { applyTextCase, DEFAULT_FRAME, layoutTextFrame, shrinkToWidth } from "./textLayout.js";
 import { FULL_CROP, isFullCrop, normalizeCrop, placeImage } from "./imageCrop.js";
+import { addRolesFromPersons, countByRule } from "./roles.js";
 
 const SCALE = 5.2; // px per mm
 const MIN_MM = 4;
@@ -402,6 +403,14 @@ function resolveMapping(field, sampleData, kind) {
   return found || null;
 }
 
+// A text field's color: its own, unless "Color depends on a value" is on
+// and the value it watches (e.g. role) has a color of its own.
+function resolveTextColor(field, data) {
+  const map = field.colorMap;
+  if (!map?.enabled) return field.color;
+  return resolveMapping({ mapSource: map.source, mappings: map.mappings, fallbackColor: field.color }, data, "color");
+}
+
 function isValidTimezone(tz) {
   if (!tz) return true; // empty = "auto", always valid
   try {
@@ -506,6 +515,8 @@ function textFieldDefaults() {
     textKind: "point",
     frame: { ...DEFAULT_FRAME },
     textCase: "none",
+    // Per-value color, e.g. role "organizer" -> orange (see resolveTextColor).
+    colorMap: { enabled: false, source: "role", mappings: [] },
   };
 }
 
@@ -543,6 +554,7 @@ function inflateTextField(f) {
     textKind: f.text_kind || "point",
     frame: { ...DEFAULT_FRAME, ...(f.frame || {}) },
     textCase: f.text_case || "none",
+    colorMap: f.color_map ? { enabled: true, source: f.color_map.source || "role", mappings: f.color_map.mappings || [] } : { enabled: false, source: "role", mappings: [] },
   };
 }
 function inflateImageField(f) {
@@ -750,6 +762,9 @@ export default function BadgeDesigner() {
       setState((prev) => ({
         ...prev,
         wcif, // full raw WCIF, kept so "Generate PDF" can use REAL per-competitor data later
+        // Every role and role combination present gets a rule (existing
+        // rules and their labels are kept), see addRolesFromPersons.
+        roleMapping: addRolesFromPersons(prev.roleMapping, badgeablePersons(wcif)),
         sampleData: {
           ...prev.sampleData,
           schedules: genericSchedule, // Map of "YYYY-MM-DD" -> placeholder row array
@@ -1155,6 +1170,7 @@ export default function BadgeDesigner() {
           Object.assign(out, { font: f.font, color: f.color, align: f.align || "left", letter_spacing: f.letterSpacing || 0, wrap: !!f.wrap });
           if (f.wrap) Object.assign(out, { w_mm: f.w_mm, break_style: f.breakStyle, line_height: f.lineHeight || 1.05 });
           if (f.textCase && f.textCase !== "none") out.text_case = f.textCase;
+          if (f.colorMap?.enabled) out.color_map = { source: f.colorMap.source, mappings: f.colorMap.mappings };
           if (f.textKind === "frame") {
             Object.assign(out, { text_kind: "frame", frame: f.frame, size: f.size, line_height: f.lineHeight || 1.05, break_style: f.breakStyle });
           } else if (f.fontMode === "autofit") Object.assign(out, { size_min: f.size_min, size_max: f.size_max, max_width_mm: f.max_width_mm || 60 });
@@ -1585,7 +1601,7 @@ export default function BadgeDesigner() {
                 addingGoogleFont={addingGoogleFont}
               />
             )}
-            {selectedId === ROLEMAP_ID && <RoleMappingPanel roleMapping={state.roleMapping} onChange={updateRoleMapping} />}
+            {selectedId === ROLEMAP_ID && <RoleMappingPanel roleMapping={state.roleMapping} onChange={updateRoleMapping} persons={state.wcif ? badgeablePersons(state.wcif) : null} />}
             {selectedId === SCHEDULE_ID && (
               <SchedulePanel
                 texts={scheduleTexts}
@@ -1657,12 +1673,14 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
   const isTextFrame = field.type === "text" && field.textKind === "frame";
   let textFont = null;
   let textValue = null;
+  let textColor = null;
   let measureText = null;
   let frameLayout = null;
   if (field.type === "text") {
     const isCustom = !BUILTIN_FONTS.includes(field.font);
     textFont = { family: isCustom ? `"${field.font}", sans-serif` : "Helvetica, Arial, sans-serif", weight: field.font === "Helvetica-Bold" ? 700 : 400 };
     textValue = applyTextCase(resolveTextValue(field, sampleData), field.textCase);
+    textColor = resolveTextColor(field, sampleData);
     measureText = canvasTextMeasurer(textFont, field.letterSpacing || 0);
     if (isTextFrame) {
       frameLayout = layoutTextFrame(textValue, field.frame, { measure: measureText, lineHeight: field.lineHeight || 1.05, breakStyle: field.breakStyle || "break-word", fixedSize: field.size || 12 });
@@ -1703,7 +1721,7 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
               lineHeight: `${lineHeight * ptPx}px`,
               fontWeight: textFont.weight,
               fontFamily: textFont.family,
-              color: field.color,
+              color: textColor,
               letterSpacing: `${(field.letterSpacing || 0) * ptPx}px`,
               whiteSpace: "pre",
               textAlign: align,
@@ -1730,7 +1748,7 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
           fontSize: fontSize * ptPx,
           fontWeight: textFont.weight,
           fontFamily: textFont.family,
-          color: field.color,
+          color: textColor,
           lineHeight: field.lineHeight || 1.05,
           letterSpacing: `${(field.letterSpacing || 0) * ptPx}px`,
           whiteSpace: textWraps ? "pre-wrap" : "pre-line",
@@ -2183,8 +2201,11 @@ function BackgroundMapPanel({ bgMap, sampleData, onChange }) {
   );
 }
 
-function RoleMappingPanel({ roleMapping, onChange }) {
+function RoleMappingPanel({ roleMapping, onChange, persons }) {
   const rules = roleMapping.rules || [];
+  // With a WCIF loaded: how many people each rule catches (first match wins).
+  const tally = persons ? countByRule(roleMapping, persons) : null;
+  const people = (n) => `${n} ${n === 1 ? "person" : "people"}`;
 
   const updateRule = (i, patch) => onChange({ rules: rules.map((r, idx) => (idx === i ? { ...r, ...patch } : r)) });
   const addRule = () => onChange({ rules: [...rules, { wcaRole: "", label: "" }] });
@@ -2203,7 +2224,7 @@ function RoleMappingPanel({ roleMapping, onChange }) {
         <Users size={12} /> ROLE MAPPING
       </div>
       <div className="text-[11px] text-neutral-400">
-        Maps a competitor's WCIF role(s) to the "role" value used throughout the template (text, tint, background images, etc). Checked top to bottom — the first matching rule wins, since a person can hold more than one role at once (e.g. an organizer who's also judging). Anyone matching nothing below gets the fallback.
+        Maps a competitor's WCIF role(s) to the "role" value used throughout the template (text, tint, background images, etc). Checked top to bottom — the first matching rule wins, since a person can hold more than one role at once (e.g. an organizer who's also judging). Anyone matching nothing below gets the fallback. Join roles with "+" (e.g. delegate+organizer) for people who have all of them — keep those above the single roles. Loading a WCIF adds every role and combination it contains.
       </div>
 
       <div className="space-y-1.5">
@@ -2230,6 +2251,11 @@ function RoleMappingPanel({ roleMapping, onChange }) {
               placeholder="role value, e.g. judge"
               className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0"
             />
+            {tally && (
+              <span className={`text-[10px] w-6 text-right shrink-0 ${tally.counts[i] ? "text-neutral-500" : "text-neutral-300"}`} title={people(tally.counts[i])}>
+                {tally.counts[i]}
+              </span>
+            )}
             <button onClick={() => removeRule(i)} className="text-neutral-400 hover:text-red-500 shrink-0">
               <Trash2 size={12} />
             </button>
@@ -2242,7 +2268,7 @@ function RoleMappingPanel({ roleMapping, onChange }) {
       </button>
 
       <div>
-        <div className="text-[11px] text-neutral-500 mb-1">Fallback (no rule matched)</div>
+        <div className="text-[11px] text-neutral-500 mb-1">Fallback (no rule matched){tally ? ` — ${people(tally.fallback)}` : ""}</div>
         <input
           value={roleMapping.fallback || ""}
           onChange={(e) => onChange({ fallback: e.target.value })}
@@ -2708,6 +2734,7 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
           )}
           <NumField label="Letter spacing (pt)" value={field.letterSpacing || 0} onChange={(v) => onChange({ letterSpacing: v })} />
           <ColorField label="Color" value={field.color} onChange={(v) => onChange({ color: v })} />
+          <TextColorMapControls field={field} sampleData={sampleData} onChange={onChange} />
         </>
       )}
 
@@ -3269,6 +3296,44 @@ function CropEditor({ src, crop, frameAspect, onChange, onClose }) {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+// "Color depends on a value" for text fields: a color per value of one
+// sample-data key (role by default); anything unmatched keeps the text's
+// own color above.
+function TextColorMapControls({ field, sampleData, onChange }) {
+  const map = field.colorMap || { enabled: false, source: "role", mappings: [] };
+  const set = (patch) => onChange({ colorMap: { ...map, ...patch } });
+  const sampleKeys = Object.keys(sampleData).filter((k) => typeof sampleData[k] !== "object");
+  return (
+    <div className="space-y-2">
+      <label className="flex items-center gap-1.5 text-xs text-neutral-600">
+        <input
+          type="checkbox"
+          checked={map.enabled}
+          onChange={(e) =>
+            set({ enabled: e.target.checked, ...(e.target.checked && map.mappings.length === 0 ? { mappings: [{ value: "organizer", color: "#f97316" }, { value: "delegate", color: "#dc2626" }] } : {}) })
+          }
+        />
+        Color depends on a value
+      </label>
+      {map.enabled && (
+        <>
+          <MappingEditor
+            mapSource={map.source}
+            mappings={map.mappings}
+            kind="color"
+            sampleKeys={sampleKeys}
+            onSourceChange={(v) => set({ source: v })}
+            onAdd={() => set({ mappings: [...map.mappings, { value: "", color: field.color }] })}
+            onUpdate={(i, patch) => set({ mappings: map.mappings.map((m, idx) => (idx === i ? { ...m, ...patch } : m)) })}
+            onRemove={(i) => set({ mappings: map.mappings.filter((_, idx) => idx !== i) })}
+          />
+          <div className="text-[10px] text-neutral-400">Values that match none of these keep the color above.</div>
+        </>
+      )}
     </div>
   );
 }
