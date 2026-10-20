@@ -19,5 +19,5 @@ Press `?` in the editor to see the keyboard shortcuts.
 
 ## Credits
 
-- **[Pedro Azevedo](https://github.com/pga27)** — creator. Built Competition Badge Generator and its badge designer (text, images, color blocks, QR codes, schedule tables and the task key), loading a competition's WCIF with each person's schedule and tasks, values driven by role or country (including country flags), template save and load, and print-ready PDF generation with font fallback for names in other scripts.
-- **[Rubén López de Juan](https://github.com/ruben-lopez-dejuan)** — collaborator. Added stages in WCIF schedules and printable stage colors; schedule options (renaming events and activities, the MBLD cube submission task, one row per round); text frames and image cropping; per-value text colors, gender variants and role combinations; the editor's redesign (layout, undo/redo, multi-select, zoom, keyboard shortcuts and clipboard); loading a competition by its WCA ID; and the Windows launcher.
+- **[Pedro Azevedo](https://github.com/pga27)** — creator
+- **[Rubén López de Juan](https://github.com/ruben-lopez-dejuan)** — collaborator

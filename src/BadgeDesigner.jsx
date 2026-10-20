@@ -1838,7 +1838,7 @@ export default function BadgeDesigner() {
       <div className="h-12 shrink-0 flex items-center gap-2 px-3 bg-white border-b border-neutral-200">
         <button onClick={() => setShowAbout(true)} className="flex items-center gap-1.5 pr-2 mr-1 border-r border-neutral-200 font-semibold text-sm hover:text-blue-700" title="About and credits">
           <BadgeCheck size={18} className="text-blue-600" />
-          <span className="hidden md:inline">Badge Designer</span>
+          <span className="hidden md:inline whitespace-nowrap">Competition Badge Generator</span>
         </button>
         <button onClick={undo} disabled={!canUndo} className={iconButton} title="Undo (Ctrl+Z)">
           <Undo2 size={16} />
