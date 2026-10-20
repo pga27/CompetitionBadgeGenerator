@@ -163,7 +163,7 @@ function fieldBoxWidthMm(field) {
 function fieldBoxHeightMm(field) {
   if (field.type === "qr") return field.size_mm || 16;
   if (field.type === "text" && field.textKind === "frame") return field.frame.auto_height ? 0 : field.frame.h_mm;
-  if (field.type === "text") return 0;
+  if (field.type === "text") return field.boxHeightMm > 0 ? field.boxHeightMm : 0;
   return field.h_mm || 8;
 }
 
@@ -464,6 +464,17 @@ function canvasTextMeasurer(font, letterSpacing) {
   };
 }
 
+// The font's vertical metrics as the browser uses them, as fractions of
+// the font size: cap height (for centering by the letters, see
+// textLayout.js) and the ascent/descent CSS uses to place the baseline
+// inside a line box.
+function canvasFontMetrics(font) {
+  measureCanvas ||= document.createElement("canvas").getContext("2d");
+  measureCanvas.font = `${font.weight} 100px ${font.family}`;
+  const m = measureCanvas.measureText("H");
+  return { capHeight: m.actualBoundingBoxAscent / 100 || 0.72, ascent: m.fontBoundingBoxAscent / 100 || 0.9, descent: m.fontBoundingBoxDescent / 100 || 0.2 };
+}
+
 function anchorTransform(align) {
   if (align === "center") return "translateX(-50%)";
   if (align === "right") return "translateX(-100%)";
@@ -519,6 +530,10 @@ function textFieldDefaults() {
     textCase: "none",
     // Per-value color, e.g. role "organizer" -> orange (see resolveTextColor).
     colorMap: { enabled: false, source: "role", mappings: [] },
+    // Point text only: an optional box height (0 = none) the text is
+    // aligned in vertically, like a spreadsheet cell.
+    boxHeightMm: 0,
+    vAlign: "top",
   };
 }
 
@@ -541,6 +556,8 @@ function inflateTextField(f) {
     useValueMap: !!f.value_map,
     valueMap: f.value_map || [],
     genderVariants: !!f.gender_variants,
+    boxHeightMm: f.box_height_mm || 0,
+    vAlign: f.v_align || "top",
     font: f.font || "Helvetica",
     color: f.color || "#141414",
     align: f.align || "left",
@@ -820,7 +837,7 @@ export default function BadgeDesigner() {
         for (const el of canvas.querySelectorAll("[data-field-id]")) {
           // A non-wrapping text box is auto-width and its text is shifted by
           // its alignment, so measure the text itself rather than the box.
-          const target = el.dataset.fieldType === "text" && el.firstElementChild ? el.firstElementChild : el;
+          const target = el.dataset.fieldType === "text" ? el.querySelector("[data-text-content]") || el : el;
           const r = target.getBoundingClientRect();
           if (r.left < safe.left - TOL || r.top < safe.top - TOL || r.right > safe.right + TOL || r.bottom > safe.bottom + TOL) next.push(el.dataset.fieldId);
         }
@@ -1066,6 +1083,10 @@ export default function BadgeDesigner() {
         const newSize = Math.abs(nw - d.origW) >= Math.abs(nh - d.origH) ? nw : nh;
         const maxSize = Math.min(pw - d.origX, ph - d.origY);
         applyFieldPatch(d.id, { size_mm: round1(clamp(newSize, MIN_MM, maxSize)) });
+      } else if (dragged?.type === "text") {
+        // Wrapped point text: width, plus the box height when it has one.
+        const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
+        applyFieldPatch(d.id, { w_mm: round1(nw), ...(dragged.boxHeightMm > 0 ? { boxHeightMm: round1(nh) } : {}) });
       } else {
         const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
         applyFieldPatch(d.id, { w_mm: round1(nw), h_mm: round1(nh) });
@@ -1179,6 +1200,7 @@ export default function BadgeDesigner() {
             Object.assign(out, { text_kind: "frame", frame: f.frame, size: f.size, line_height: f.lineHeight || 1.05, break_style: f.breakStyle });
           } else if (f.fontMode === "autofit") Object.assign(out, { size_min: f.size_min, size_max: f.size_max, max_width_mm: f.max_width_mm || 60 });
           else out.size = f.size;
+          if (f.textKind !== "frame" && f.boxHeightMm > 0) Object.assign(out, { box_height_mm: f.boxHeightMm, v_align: f.vAlign || "top" });
         } else if (f.type === "image") {
           Object.assign(out, { w_mm: f.w_mm, h_mm: f.h_mm, mapped: f.mapped });
           if (!isFullCrop(f.crop)) out.crop = f.crop;
@@ -1680,6 +1702,7 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
   let textColor = null;
   let measureText = null;
   let frameLayout = null;
+  let fontMetrics = null;
   if (field.type === "text") {
     const isCustom = !BUILTIN_FONTS.includes(field.font);
     textFont = { family: isCustom ? `"${field.font}", sans-serif` : "Helvetica, Arial, sans-serif", weight: field.font === "Helvetica-Bold" ? 700 : 400 };
@@ -1687,29 +1710,39 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
     textColor = resolveTextColor(field, sampleData);
     measureText = canvasTextMeasurer(textFont, field.letterSpacing || 0);
     if (isTextFrame) {
-      frameLayout = layoutTextFrame(textValue, field.frame, { measure: measureText, lineHeight: field.lineHeight || 1.05, breakStyle: field.breakStyle || "break-word", fixedSize: field.size || 12 });
+      fontMetrics = canvasFontMetrics(textFont);
+      frameLayout = layoutTextFrame(textValue, field.frame, { measure: measureText, lineHeight: field.lineHeight || 1.05, breakStyle: field.breakStyle || "break-word", fixedSize: field.size || 12, capHeight: fontMetrics.capHeight });
     }
   }
 
   let h = field.type === "schedule" ? scheduleHeightPx : field.type === "taskkey" ? taskKeyHeightPx : fieldBoxHeightMm(field) * scale;
   if (isTextFrame && field.frame.auto_height) h = (frameLayout.blockHeight + 2 * frameLayout.padding) * ptPx;
+  const pointBox = field.type === "text" && !isTextFrame && field.boxHeightMm > 0;
 
   const style = {
     position: "absolute",
     left: field.x_mm * scale,
     top: field.y_mm * scale,
     width: field.type === "text" && !isTextFrame ? (textWraps ? w : "auto") : w,
-    height: field.type === "text" && !isTextFrame ? "auto" : h,
+    height: field.type === "text" && !isTextFrame ? (pointBox ? field.boxHeightMm * scale : "auto") : h,
     outline: selected ? "1.5px solid #2563eb" : outsideMargin ? "1.5px dashed #f59e0b" : "1px dashed rgba(0,0,0,0.25)",
     cursor: "move",
     userSelect: "none",
-    transform: field.rotate ? `rotate(-${field.rotate}deg)` : undefined,
+    // Unwrapped point text is anchored at X by its alignment (left edge /
+    // center / right edge), so the whole box shifts — not just the text —
+    // and its outline (and box height) stays around the text. Translate is
+    // listed last so it applies before the rotation, which keeps pivoting
+    // on the X/Y anchor like the PDF does.
+    transform: [field.rotate ? `rotate(-${field.rotate}deg)` : null, field.type === "text" && !isTextFrame && !textWraps ? anchorTransform(align) : null].filter(Boolean).join(" ") || undefined,
     transformOrigin: "top left",
   };
 
   let content;
   if (field.type === "text" && isTextFrame) {
-    const { lines, size, lineHeight, offsetY, padding, innerW, overflow } = frameLayout;
+    const { lines, size, lineHeight, baselines, padding, innerW, overflow } = frameLayout;
+    // Each line box is placed so its baseline (where CSS puts it: half the
+    // leading plus the font's ascent) lands on the layout's baseline.
+    const baselineInLine = ((lineHeight - (fontMetrics.ascent + fontMetrics.descent) * size) / 2 + fontMetrics.ascent * size) * ptPx;
     content = (
       <>
         {lines.map((line, i) => (
@@ -1718,7 +1751,7 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
             style={{
               position: "absolute",
               left: padding * ptPx,
-              top: (padding + offsetY + i * lineHeight) * ptPx,
+              top: (padding + baselines[i]) * ptPx - baselineInLine,
               width: innerW * ptPx,
               height: lineHeight * ptPx,
               fontSize: size * ptPx,
@@ -1746,8 +1779,9 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
       field.fontMode === "autofit"
         ? shrinkToWidth(textValue, { min: field.size_min || 8, max: field.size_max || 16, maxWidth: (field.max_width_mm || 60) * MM_TO_PT, measure: measureText })
         : field.size;
-    content = (
+    const text = (
       <div
+        data-text-content
         style={{
           fontSize: fontSize * ptPx,
           fontWeight: textFont.weight,
@@ -1755,17 +1789,27 @@ function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointer
           color: textColor,
           lineHeight: field.lineHeight || 1.05,
           letterSpacing: `${(field.letterSpacing || 0) * ptPx}px`,
-          whiteSpace: textWraps ? "pre-wrap" : "pre-line",
+          // Without wrap, only explicit line breaks break lines — as in the
+          // PDF. ("pre-line" also wrapped long text at the page edge.)
+          whiteSpace: textWraps ? "pre-wrap" : "pre",
           wordBreak: textWraps ? field.breakStyle || "break-word" : undefined,
           overflowWrap: textWraps ? "anywhere" : undefined,
           width: textWraps ? "100%" : undefined,
           textAlign: align,
-          transform: textWraps ? undefined : anchorTransform(align),
           display: textWraps ? undefined : "inline-block",
         }}
       >
         {textValue}
       </div>
+    );
+    // In a box (see drawTextField in pdfExport.js): the text block at its
+    // top, middle or bottom, by flex alignment of the block's own height.
+    content = pointBox ? (
+      <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "flex-start", justifyContent: { middle: "center", bottom: "flex-end" }[field.vAlign] || "flex-start" }}>
+        {text}
+      </div>
+    ) : (
+      text
     );
   } else if (field.type === "image") {
     let src = field.preview;
@@ -2725,6 +2769,16 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
                   </div>
                 )}
                 {!field.wrap && <div className="text-[10px] text-neutral-400 mt-1.5">Without wrap, alignment treats X as the anchor point (left edge / center / right edge of the text).</div>}
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <NumField label="Box height (mm)" value={field.boxHeightMm || 0} onChange={(v) => onChange({ boxHeightMm: Math.max(0, v) })} />
+                <SelectField label="Vertical align" value={field.vAlign || "top"} onChange={(v) => onChange({ vAlign: v })} options={["top", "middle", "bottom"]} />
+              </div>
+              <div className="text-[10px] text-neutral-400 -mt-2">
+                {field.boxHeightMm > 0
+                  ? "The text sits at the top, middle (same space above and below) or bottom of a box this tall, starting at Y — like a spreadsheet cell."
+                  : "Set a box height (0 = none) to align the text vertically inside it."}
               </div>
 
               <div>

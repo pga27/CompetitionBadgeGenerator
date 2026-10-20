@@ -8,7 +8,8 @@
 // A text frame works like frame text in Affinity: a fixed-width box whose
 // text wraps inside it, with:
 // - fit "fixed": one size; "shrink": the largest size between size_min and
-//   size_max that fits the frame. With wrap_below set, shrinking first tries
+//   size_max that fits the frame without splitting any word in two — only
+//   if nothing fits even at size_min are words split, per the break style. With wrap_below set, shrinking first tries
 //   to keep the text on a single line down to that size, and only then
 //   breaks it into more lines (which may let it grow back up to size_max).
 // - max_lines: 0 = as many as fit.
@@ -17,6 +18,13 @@
 //   "clip" (drop the lines that fall outside), "ellipsis" (same, ending the
 //   last line with "…").
 // - v_align top/middle/bottom and padding_mm (inset on every side).
+//   Vertical alignment goes by the letters, not the line boxes: from the
+//   top of the capitals on the first line to the baseline of the last one
+//   (capHeight = cap height / font size, from the font). "middle" leaves
+//   the same space above the capitals as below the last baseline, so names
+//   in capitals look centered; lowercase descenders hang below that.
+//   The layout returns each line's baseline, so both renderers put every
+//   line in exactly the same place regardless of how they size line boxes.
 
 const SIZE_STEP = 0.5;
 const MM_TO_PT = 72 / 25.4;
@@ -47,13 +55,20 @@ export function applyTextCase(text, textCase) {
 // kept. "break-word" breaks at spaces and only splits a word that can't fit
 // on a line of its own; "break-all" may split anywhere.
 export function wrapText(text, size, maxWidth, measure, breakStyle = "break-word") {
+  return wrapTextInfo(text, size, maxWidth, measure, breakStyle).lines;
+}
+
+// wrapText, plus whether some word had to be split across lines.
+function wrapTextInfo(text, size, maxWidth, measure, breakStyle) {
   const lines = [];
+  let splitWord = false;
   const fitsWidth = (s) => measure(s, size) <= maxWidth;
 
   // Pushes as many leading characters of `word` as fit on a line, repeatedly.
   const splitLongWord = (word) => {
     let rest = word;
     while (rest && !fitsWidth(rest)) {
+      splitWord = true;
       let n = 1;
       while (n < rest.length && fitsWidth(rest.slice(0, n + 1))) n++;
       lines.push(rest.slice(0, n));
@@ -84,24 +99,24 @@ export function wrapText(text, size, maxWidth, measure, breakStyle = "break-word
     }
     lines.push(current);
   }
-  return lines;
+  return { lines, splitWord };
 }
 
 /**
  * Lays out `text` in a frame. Returns { size, lines, lineHeight,
- * blockHeight, offsetY, overflow }: font size in pt, the lines to draw,
- * the distance between their tops, the drawn block's height, how far below
- * the frame's top inset the first line starts (vertical alignment), and
- * whether the text didn't fit.
+ * blockHeight, baselines, overflow, padding, innerW }: font size in pt,
+ * the lines to draw, the distance between them, the height the lines take
+ * (what auto height grows to), each line's baseline measured down from the
+ * frame's inner top (padding excluded), and whether the text didn't fit.
  */
-export function layoutTextFrame(text, frame, { measure, lineHeight = 1.05, breakStyle = "break-word", fixedSize = 12 }) {
+export function layoutTextFrame(text, frame, { measure, lineHeight = 1.05, breakStyle = "break-word", fixedSize = 12, capHeight = 0.72 }) {
   const f = { ...DEFAULT_FRAME, ...frame };
   const pad = (f.padding_mm || 0) * MM_TO_PT;
   const innerW = Math.max(f.w_mm * MM_TO_PT - 2 * pad, 1);
   const innerH = f.auto_height ? Infinity : Math.max(f.h_mm * MM_TO_PT - 2 * pad, 1);
   const maxLines = f.max_lines > 0 ? f.max_lines : Infinity;
 
-  const linesAt = (size) => wrapText(text, size, innerW, measure, breakStyle);
+  const linesAt = (size, style = breakStyle) => wrapTextInfo(text, size, innerW, measure, style);
   const heightOf = (n, size) => n * size * lineHeight;
   const fits = (lines, size, allowedLines) => lines.length <= allowedLines && heightOf(lines.length, size) <= innerH + 0.01;
 
@@ -112,20 +127,28 @@ export function layoutTextFrame(text, frame, { measure, lineHeight = 1.05, break
     const max = Math.max(f.size_max, f.size_min);
     const min = Math.min(f.size_max, f.size_min);
     const singleLineFloor = f.wrap_below > 0 ? Math.min(Math.max(f.wrap_below, min), max) : min;
-    // 1. One line, from the biggest size down to the wrap threshold.
-    for (let s = max; s >= singleLineFloor - 1e-9 && !found; s -= SIZE_STEP) {
-      const l = linesAt(s);
-      if (fits(l, s, 1)) [size, lines, found] = [s, l, true];
-    }
-    // 2. Then as many lines as allowed, again from the biggest size.
-    for (let s = max; s >= min - 1e-9 && !found; s -= SIZE_STEP) {
-      const l = linesAt(s);
-      if (fits(l, s, maxLines)) [size, lines, found] = [s, l, true];
-    }
-    if (!found) [size, lines] = [min, linesAt(min)];
+    // wholeWords: only accept sizes where every word stays whole (breaking
+    // at spaces only); otherwise words may be split per the break style.
+    const search = (style, wholeWords) => {
+      const ok = (r, s, allowed) => fits(r.lines, s, allowed) && !(wholeWords && r.splitWord);
+      // 1. One line, from the biggest size down to the wrap threshold.
+      for (let s = max; s >= singleLineFloor - 1e-9 && !found; s -= SIZE_STEP) {
+        const r = linesAt(s, style);
+        if (ok(r, s, 1)) [size, lines, found] = [s, r.lines, true];
+      }
+      // 2. Then as many lines as allowed, again from the biggest size.
+      for (let s = max; s >= min - 1e-9 && !found; s -= SIZE_STEP) {
+        const r = linesAt(s, style);
+        if (ok(r, s, maxLines)) [size, lines, found] = [s, r.lines, true];
+      }
+    };
+    search("break-word", true);
+    // Nothing fits with whole words, even at the minimum: split words.
+    if (!found) search(breakStyle, false);
+    if (!found) [size, lines] = [min, linesAt(min).lines];
   } else {
     size = fixedSize;
-    lines = linesAt(size);
+    lines = linesAt(size).lines;
     found = fits(lines, size, maxLines);
   }
 
@@ -144,13 +167,18 @@ export function layoutTextFrame(text, frame, { measure, lineHeight = 1.05, break
   }
 
   const blockHeight = heightOf(lines.length, size);
-  let offsetY = 0;
-  if (Number.isFinite(innerH) && blockHeight < innerH) {
-    if (f.v_align === "middle") offsetY = (innerH - blockHeight) / 2;
-    else if (f.v_align === "bottom") offsetY = innerH - blockHeight;
-  }
+  const step = size * lineHeight;
+  const cap = capHeight * size;
+  // Letters span from the first line's cap top to the last line's baseline.
+  const inkHeight = Math.max(lines.length - 1, 0) * step + cap;
+  const boxH = Number.isFinite(innerH) ? innerH : blockHeight;
+  let capTop = 0;
+  if (f.v_align === "middle") capTop = (boxH - inkHeight) / 2;
+  else if (f.v_align === "bottom") capTop = boxH - inkHeight;
+  if (f.auto_height) capTop = (blockHeight - inkHeight) / 2; // grows with the text: keep it centered in its own lines
+  const baselines = lines.map((_, i) => capTop + cap + i * step);
 
-  return { size, lines, lineHeight: size * lineHeight, blockHeight, offsetY, overflow, padding: pad, innerW };
+  return { size, lines, lineHeight: step, blockHeight, baselines, overflow, padding: pad, innerW };
 }
 
 // Point-text auto-fit (the older, single-anchor text mode): the largest

@@ -373,15 +373,18 @@ function drawTextField(page, field, ctx, fonts, originX, originY) {
     // Text frame: the shared layout engine (textLayout.js) picks the size
     // and line breaks; lines are aligned inside the frame's inner box.
     const measure = (s, size) => planWidth(buildCharPlan(fonts, preferredFont, s, size), letterSpacing);
-    const layout = layoutTextFrame(value, field.frame, { measure, lineHeight: field.lineHeight || 1.05, breakStyle: field.breakStyle || "break-word", fixedSize: field.size || 12 });
+    // Cap height (as a fraction of the size) for centering by the letters:
+    // from the font itself for uploaded fonts, Helvetica's 718/1000 otherwise.
+    const fk = preferredFont.fontkitFont;
+    const capHeight = fk && fk.capHeight > 0 ? fk.capHeight / fk.unitsPerEm : 0.718;
+    const layout = layoutTextFrame(value, field.frame, { measure, lineHeight: field.lineHeight || 1.05, breakStyle: field.breakStyle || "break-word", fixedSize: field.size || 12, capHeight });
     layout.lines.forEach((line, i) => {
       const plan = buildCharPlan(fonts, preferredFont, line, layout.size);
       const textW = planWidth(plan, letterSpacing);
       let offset = 0;
       if (align === "center") offset = (layout.innerW - textW) / 2;
       else if (align === "right") offset = layout.innerW - textW;
-      const lineTopY = originY - layout.padding - layout.offsetY - i * layout.lineHeight;
-      drawCharPlan(page, plan, originX + layout.padding + offset, lineTopY - layout.size * 0.75, layout.size, letterSpacing, color);
+      drawCharPlan(page, plan, originX + layout.padding + offset, originY - layout.padding - layout.baselines[i], layout.size, letterSpacing, color);
     });
     return;
   }
@@ -418,19 +421,24 @@ function drawTextField(page, field, ctx, fonts, originX, originY) {
     drawCharPlan(page, plan, originX + offset, baselineY, size, letterSpacing, color);
   };
 
-  if (isWrap) {
-    const lines = wrapLines(fonts, preferredFont, value, size, boxW, field.breakStyle || field.break_style || "break-word");
-    const lineHeightPt = size * (field.lineHeight || field.line_height || 1.05);
-    lines.forEach((line, i) => drawLine(line, originY - i * lineHeightPt));
-  } else {
-    // Not wrapped to a box width, but an explicit "\n" (e.g. from a
-    // static/template textarea, or a value-map label) should still break
-    // into multiple lines — "wrap" only controls automatic word-wrap to
-    // fit boxW, it shouldn't gate hard line breaks.
-    const rawLines = value.split("\n");
-    const lineHeightPt = size * (field.lineHeight || field.line_height || 1.05);
-    rawLines.forEach((line, i) => drawLine(line, originY - i * lineHeightPt));
+  // Not wrapped to a box width, an explicit "\n" (e.g. from a static/
+  // template textarea, or a value-map label) still breaks into multiple
+  // lines — "wrap" only controls automatic word-wrap to fit boxW, it
+  // shouldn't gate hard line breaks.
+  const lines = isWrap ? wrapLines(fonts, preferredFont, value, size, boxW, field.breakStyle || field.break_style || "break-word") : value.split("\n");
+  const lineHeightPt = size * (field.lineHeight || field.line_height || 1.05);
+
+  // Optional box height: the text block sits at the top, middle or bottom
+  // of it, like text in a spreadsheet cell (same rule as FieldBox).
+  const boxHeightMm = field.boxHeightMm ?? field.box_height_mm ?? 0;
+  let offsetY = 0;
+  if (boxHeightMm > 0) {
+    const free = mmv(boxHeightMm) - lines.length * lineHeightPt;
+    const vAlign = field.vAlign || field.v_align || "top";
+    if (vAlign === "middle") offsetY = free / 2;
+    else if (vAlign === "bottom") offsetY = free;
   }
+  lines.forEach((line, i) => drawLine(line, originY - offsetY - i * lineHeightPt));
 }
 
 async function drawImageField(page, field, ctx, pdfDoc, imageCache, originX, originY) {
