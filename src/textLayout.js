@@ -10,10 +10,14 @@
 // - fit "fixed": one size; "shrink": the largest size between size_min and
 //   size_max that fits the frame without splitting any word in two. Only
 //   if nothing fits even at size_min do lines also break after hyphens,
-//   and only if that doesn't fit either are words split, per break style. With wrap_below set, shrinking first tries
-//   to keep the text on a single line down to that size, and only then
-//   breaks it into more lines (which may let it grow back up to size_max).
+//   and only if that doesn't fit either are words split, per break style.
+//   With wrap_below set, shrinking first tries to keep the text on a
+//   single line down to that size, and only then breaks it into more lines
+//   (which may let it grow back up to size_max).
 // - max_lines: 0 = as many as fit.
+// - min_lines: put the text on at least this many lines when it has
+//   somewhere to break, with the words shared out evenly between them
+//   ("RUBÉN LÓPEZ" / "DE JUAN"); a single unbreakable word stays one line.
 // - auto_height: the frame grows with its text instead of having a height.
 // - overflow, for text that still doesn't fit: "visible" (draw it all),
 //   "clip" (drop the lines that fall outside), "ellipsis" (same, ending the
@@ -40,6 +44,7 @@ export const DEFAULT_FRAME = {
   size_max: 24,
   wrap_below: 0,
   max_lines: 0,
+  min_lines: 1,
   v_align: "top",
   padding_mm: 0,
   overflow: "visible",
@@ -118,6 +123,43 @@ export function breakPoints(paragraph) {
   return pieces;
 }
 
+// `text` split into `count` lines (fewer if it has fewer break points) with
+// the words shared out as evenly as possible — the split whose widest line
+// is narrowest. Null when there's nothing to split (one word, or text with
+// its own line breaks).
+function balancedLines(text, count, size, measure, hyphens) {
+  if (text.includes("\n")) return null;
+  const pieces = hyphens ? breakPoints(text) : text.split(" ").map((word, i) => ({ text: word, sep: i > 0 ? " " : "" }));
+  if (pieces.length < 2) return null;
+  const k = Math.min(count, pieces.length);
+  const join = (from, to) => pieces.slice(from, to).map((p, i) => (i > 0 ? p.sep : "") + p.text).join("");
+  const memo = new Map();
+  // Best split of pieces[from..] into n lines: { width of its widest line, line ends }.
+  const best = (from, n) => {
+    const key = `${from}:${n}`;
+    if (memo.has(key)) return memo.get(key);
+    let result;
+    if (n === 1) {
+      result = { width: measure(join(from, pieces.length), size), ends: [pieces.length] };
+    } else {
+      result = { width: Infinity, ends: [] };
+      for (let to = from + 1; to <= pieces.length - (n - 1); to++) {
+        const rest = best(to, n - 1);
+        const width = Math.max(measure(join(from, to), size), rest.width);
+        if (width < result.width) result = { width, ends: [to, ...rest.ends] };
+      }
+    }
+    memo.set(key, result);
+    return result;
+  };
+  let from = 0;
+  return best(0, k).ends.map((to) => {
+    const line = join(from, to);
+    from = to;
+    return line;
+  });
+}
+
 /**
  * Lays out `text` in a frame. Returns { size, lines, lineHeight,
  * blockHeight, baselines, overflow, padding, innerW }: font size in pt,
@@ -132,13 +174,30 @@ export function layoutTextFrame(text, frame, { measure, lineHeight = 1.05, break
   const innerH = f.auto_height ? Infinity : Math.max(f.h_mm * MM_TO_PT - 2 * pad, 1);
   const maxLines = f.max_lines > 0 ? f.max_lines : Infinity;
 
-  const linesAt = (size, style = breakStyle, hyphens = true) => wrapTextInfo(text, size, innerW, measure, style, hyphens);
+  const minLines = Math.min(Math.max(f.min_lines || 1, 1), maxLines);
+  // How many lines min_lines can actually ask for: no more than the text
+  // has pieces to break into, counting hyphens (so a lone "GARCÍA-PÉREZ"
+  // still gets its two lines, once spaces alone can't give them).
+  const reachableLines = text.includes("\n") ? 1 : Math.min(minLines, breakPoints(text).length);
+
+  // Wrapped lines at `size`; when that gives fewer than min_lines, the
+  // words shared out evenly over min_lines lines instead (tooWide if one
+  // of those lines is still wider than the frame).
+  const linesAt = (size, style = breakStyle, hyphens = true) => {
+    const r = wrapTextInfo(text, size, innerW, measure, style, hyphens);
+    if (r.lines.length >= minLines) return r;
+    const balanced = balancedLines(text, minLines, size, measure, hyphens);
+    if (!balanced) return r;
+    return { lines: balanced, splitWord: false, tooWide: balanced.some((l) => measure(l, size) > innerW) };
+  };
   const heightOf = (n, size) => n * size * lineHeight;
   const fits = (lines, size, allowedLines) => lines.length <= allowedLines && heightOf(lines.length, size) <= innerH + 0.01;
 
   let size;
   let lines;
   let found = false;
+  let usedHyphens = true; // whether the chosen lines may break after hyphens
+  let wholeWordLayout = false; // whether they break only between pieces (no split words)
   if (f.fit === "shrink") {
     const max = Math.max(f.size_max, f.size_min);
     const min = Math.min(f.size_max, f.size_min);
@@ -147,17 +206,19 @@ export function layoutTextFrame(text, frame, { measure, lineHeight = 1.05, break
     // words may be split per the break style. hyphens: whether lines may
     // also break after a hyphen ("GARCÍA-" / "PÉREZ").
     const search = (style, wholeWords, hyphens) => {
-      const ok = (r, s, allowed) => fits(r.lines, s, allowed) && !(wholeWords && r.splitWord);
-      // 1. One line, from the biggest size down to the wrap threshold.
-      for (let s = max; s >= singleLineFloor - 1e-9 && !found; s -= SIZE_STEP) {
+      const ok = (r, s, allowed) => fits(r.lines, s, allowed) && !(wholeWords && r.splitWord) && !r.tooWide && r.lines.length >= reachableLines;
+      // 1. One line, from the biggest size down to the wrap threshold
+      // (skipped when at least two lines are required).
+      for (let s = max; minLines === 1 && s >= singleLineFloor - 1e-9 && !found; s -= SIZE_STEP) {
         const r = linesAt(s, style, hyphens);
-        if (ok(r, s, 1)) [size, lines, found] = [s, r.lines, true];
+        if (ok(r, s, 1)) [size, lines, found, wholeWordLayout] = [s, r.lines, true, wholeWords && !r.splitWord];
       }
       // 2. Then as many lines as allowed, again from the biggest size.
       for (let s = max; s >= min - 1e-9 && !found; s -= SIZE_STEP) {
         const r = linesAt(s, style, hyphens);
-        if (ok(r, s, maxLines)) [size, lines, found] = [s, r.lines, true];
+        if (ok(r, s, maxLines)) [size, lines, found, wholeWordLayout] = [s, r.lines, true, wholeWords && !r.splitWord];
       }
+      if (found) usedHyphens = hyphens;
     };
     // Least to most invasive, each only if the previous fits at no size:
     // breaking at spaces only, then also after hyphens (a hyphenated
@@ -172,8 +233,21 @@ export function layoutTextFrame(text, frame, { measure, lineHeight = 1.05, break
     // Same order at a fixed size: after a hyphen only if some word would
     // otherwise have to be split.
     const spacesOnly = linesAt(size, breakStyle, false);
-    lines = spacesOnly.splitWord ? linesAt(size).lines : spacesOnly.lines;
+    const useHyphens = spacesOnly.splitWord || spacesOnly.tooWide;
+    const r = useHyphens ? linesAt(size) : spacesOnly;
+    // Even lines too wide for the frame: fall back to plain wrapping.
+    lines = r.tooWide ? wrapTextInfo(text, size, innerW, measure, breakStyle, true).lines : r.lines;
+    usedHyphens = useHyphens;
+    wholeWordLayout = !r.tooWide && !r.splitWord;
     found = fits(lines, size, maxLines);
+  }
+
+  // With min_lines on, share the words out evenly over however many lines
+  // were chosen ("RUBÉN LÓPEZ DE" / "JUAN" -> "RUBÉN LÓPEZ" / "DE JUAN").
+  // Its widest line is never wider than the original's, so it still fits.
+  if (minLines > 1 && wholeWordLayout && lines.length > 1) {
+    const balanced = balancedLines(text, lines.length, size, measure, usedHyphens);
+    if (balanced && balanced.length === lines.length) lines = balanced;
   }
 
   const overflow = !found;

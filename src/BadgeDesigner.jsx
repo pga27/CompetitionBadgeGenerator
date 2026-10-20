@@ -3161,9 +3161,15 @@ function TextFrameOptions({ field, onChange, fontSelect }) {
         </>
       )}
       <div className="grid grid-cols-2 gap-2">
+        <NumField label="Min lines" value={frame.min_lines || 1} onChange={(v) => set({ min_lines: Math.max(1, Math.round(v)) })} />
         <NumField label="Max lines (0 = any)" value={frame.max_lines || 0} onChange={(v) => set({ max_lines: Math.max(0, Math.round(v)) })} />
-        <NumField label="Line height" value={field.lineHeight || 1.05} onChange={(v) => onChange({ lineHeight: v })} />
       </div>
+      {(frame.min_lines || 1) > 1 && (
+        <div className="text-[10px] text-neutral-400 -mt-2">
+          The text goes on at least this many lines when it has somewhere to break, with the words shared out evenly ("RUBÉN LÓPEZ" / "DE JUAN"). A single word stays on one line.
+        </div>
+      )}
+      <NumField label="Line height" value={field.lineHeight || 1.05} onChange={(v) => onChange({ lineHeight: v })} />
       <SelectField label="Break style" value={field.breakStyle || "break-word"} onChange={(v) => onChange({ breakStyle: v })} options={["break-word", "break-all"]} />
       <SelectField label="If it still doesn't fit" value={frame.overflow} onChange={(v) => set({ overflow: v })} options={["visible", "clip", "ellipsis"]} />
       <div className="text-[10px] text-neutral-400 -mt-2">"clip" drops the lines that fall outside the frame; "ellipsis" also ends the last one with "…". A red marker on the frame means its text doesn't fit.</div>
