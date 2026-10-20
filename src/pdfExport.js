@@ -252,6 +252,9 @@ function fontForChar(fonts, preferredFont, ch) {
   if (canRenderCodePoint(preferredFont, codePoint)) {
     return preferredFont;
   }
+  for (const part of preferredFont?.extras || []) {
+    if (canRenderCodePoint(part, codePoint)) return part;
+  }
 
   // preferredFont (the field's own font, whether that's Helvetica or a
   // font uploaded through the Fonts panel) can't render this codepoint —
@@ -1162,9 +1165,19 @@ export async function generateBadgesPdf(state, wcif, onProgress) {
         const fontkitFont = fontkit.create(bytes);
         const pdfFont = await pdfDoc.embedFont(bytes, { subset: false });
 
+        // Further parts of the same font (e.g. a library font's latin-ext
+        // file), tried after the main one for each character.
+        const extras = [];
+        for (const part of f.extraParts || []) {
+          if (!part.dataUrl) continue;
+          const partBytes = dataUrlToBytes(part.dataUrl);
+          extras.push({ pdfFont: await pdfDoc.embedFont(partBytes, { subset: false }), fontkitFont: fontkit.create(partBytes) });
+        }
+
         fonts.custom[f.family] = {
           pdfFont,
           fontkitFont,
+          extras,
         };
       } catch (e) {
         console.error(`Could not embed font ${f.family}, falling back to Helvetica`, e);

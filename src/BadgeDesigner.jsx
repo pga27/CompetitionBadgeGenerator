@@ -36,9 +36,9 @@ import {
   ZoomIn,
   ZoomOut,
   Maximize,
+  Ruler,
   FolderOpen,
   Save,
-  BadgeCheck,
   CopyPlus,
   BringToFront,
   SendToBack,
@@ -63,6 +63,9 @@ import { pickMappedLabel } from "./valueMap.js";
 import { useHistory } from "./editor/useHistory.js";
 import ShortcutsDialog from "./editor/ShortcutsDialog.jsx";
 import AboutDialog from "./editor/AboutDialog.jsx";
+import FontPicker from "./editor/FontPicker.jsx";
+import Logo from "./editor/Logo.jsx";
+import { libraryFamily } from "./fontLibrary.js";
 
 const SCALE = 5.2; // px per mm
 const MIN_MM = 4;
@@ -190,16 +193,6 @@ function fieldBoxHeightMm(field) {
   return field.h_mm || 8;
 }
 
-// One-click Google Fonts you can add without hunting down a .ttf file
-// yourself. Each preset fetches one specific weight of the family as a
-// separate selectable "font" — same convention as the built-in Helvetica /
-// Helvetica-Bold pair, where weight is a distinct font choice rather than
-// a toggle. Add more entries here to offer more presets later.
-const GOOGLE_FONT_PRESETS = [
-  { label: "Rubik", family: "Rubik", weight: "400" },
-  { label: "Rubik Bold", family: "Rubik", weight: "700" },
-];
-
 // Wraps a promise with a hard deadline: without this, a stalled network
 // request or a broken WASM module init can hang silently forever with
 // nothing to catch it (see the equivalent, more-detailed comment on
@@ -225,56 +218,65 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-// Fetches one weight of a Google Font as a FULL family (no `text=`
-// subsetting) — this is for a font the person picks for arbitrary,
-// not-yet-known text (any competitor's name, any static/template string),
-// unlike the per-character subsetted fetch in pdfExport.js's automatic
-// script-fallback system, which only ever needs specific already-known
-// characters. Returns a data: URL in the same shape FileReader.
-// readAsDataURL produces for a manually-uploaded file, since the rest of
-// the app (embedding, live preview, template export) expects exactly
-// that shape regardless of where the font actually came from.
-async function fetchGoogleFontFamilyDataUrl(family, weight) {
+// Fetches one weight of a Google Font for arbitrary, not-yet-known text
+// (any competitor's name, any static/template string) — unlike the
+// per-character subsetted fetch in pdfExport.js's automatic script
+// fallback, which only needs specific already-known characters.
+//
+// Google serves a font in pieces, one @font-face block per script subset,
+// each preceded by a "/* subsetname */" comment and covering
+// only its own unicode-range. "latin" has A–Z, accents and ñ (U+0000–00FF
+// and a few more); "latin-ext" has ł, č, ş, ő… but NOT the basic letters,
+// so a font needs both. Returns them as [{ dataUrl, unicodeRange }],
+// latin first — data: URLs in the same shape FileReader.readAsDataURL
+// gives for an uploaded file, which the rest of the app expects.
+async function fetchGoogleFontParts(family, weight) {
   const cssUrl = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(family)}:wght@${weight}&display=swap`;
   const cssRes = await withTimeout(fetch(cssUrl, { mode: "cors" }), 8000, `Google Fonts CSS request for "${family}" ${weight}`);
   if (!cssRes.ok) throw new Error(`HTTP ${cssRes.status} fetching Google Fonts CSS for "${family}"`);
   const css = await cssRes.text();
 
-  // Without a `text=` param (this needs the family's full Latin coverage
-  // for arbitrary, not-yet-known text, unlike pdfExport.js's per-character
-  // subsetted fetch for already-known names), Google returns ONE
-  // @font-face block PER SCRIPT SUBSET the family supports — cyrillic,
-  // vietnamese, latin, latin-ext, etc. — not one block for the whole
-  // family, each labeled with a trailing "/* subsetname */" comment. A
-  // naive first-match would silently grab whichever subset happens to be
-  // listed first (commonly NOT latin — real responses list latin last).
-  // We need a single static file to embed as one selectable font, so this
-  // explicitly picks "latin-ext" (a superset of "latin": Latin-1 + Latin
-  // Extended-A/B, covering Polish, Czech, Turkish, etc.) if present, else
-  // falls back to plain "latin", else whatever block exists at all.
-  const blocks = [...css.matchAll(/@font-face\s*\{([^}]*)\}\s*\/\*\s*([\w-]+)\s*\*\//g)].map(([, body, label]) => ({ body, label }));
-  const chosen = blocks.find((b) => b.label === "latin-ext") || blocks.find((b) => b.label === "latin") || blocks[0];
-  if (!chosen) throw new Error(`Google Fonts CSS for "${family}" had no @font-face blocks in it: ${css.slice(0, 200)}`);
+  // The subset's name comes in a comment just BEFORE its block.
+  const blocks = [...css.matchAll(/\/\*\s*([\w-]+)\s*\*\/\s*@font-face\s*\{([^}]*)\}/g)].map(([, label, body]) => ({ body, label }));
+  const wanted = ["latin", "latin-ext"].map((label) => blocks.find((b) => b.label === label)).filter(Boolean);
+  // A font with neither (e.g. only its own script): take whatever it has.
+  const chosen = wanted.length > 0 ? wanted : blocks.slice(0, 1);
+  if (chosen.length === 0) throw new Error(`Google Fonts CSS for "${family}" had no @font-face blocks in it: ${css.slice(0, 200)}`);
 
-  const urlMatch = chosen.body.match(/url\((https:\/\/fonts\.gstatic\.com[^)]+)\)\s*format\('(\w+)'\)/);
-  if (!urlMatch) throw new Error(`Google Fonts CSS for "${family}" (${chosen.label} subset) had no usable font url in it`);
-  const [, fontUrl, format] = urlMatch;
+  return Promise.all(
+    chosen.map(async ({ body, label }) => {
+      const urlMatch = body.match(/url\((https:\/\/fonts\.gstatic\.com[^)]+)\)\s*format\('(\w+)'\)/);
+      if (!urlMatch) throw new Error(`Google Fonts CSS for "${family}" (${label} subset) had no usable font url in it`);
+      const [, fontUrl, format] = urlMatch;
+      const unicodeRange = (body.match(/unicode-range:\s*([^;]+);/) || [])[1]?.trim() || null;
 
-  const fontRes = await withTimeout(fetch(fontUrl, { mode: "cors" }), 8000, `Google Fonts file download for "${family}"`);
-  if (!fontRes.ok) throw new Error(`HTTP ${fontRes.status} fetching the font file for "${family}"`);
-  const rawBytes = new Uint8Array(await fontRes.arrayBuffer());
+      const fontRes = await withTimeout(fetch(fontUrl, { mode: "cors" }), 8000, `Google Fonts file download for "${family}" (${label})`);
+      if (!fontRes.ok) throw new Error(`HTTP ${fontRes.status} fetching the font file for "${family}"`);
+      const rawBytes = new Uint8Array(await fontRes.arrayBuffer());
 
-  // Browser fetch() always gets WOFF2 back from Google (it can't override
-  // the User-Agent header, which is what Google sniffs to decide format —
-  // see the matching note in pdfExport.js), so this needs decompressing
-  // to a real sfnt before it's usable as a font file elsewhere in the app.
-  let sfntBytes = rawBytes;
-  if (format === "woff2") {
-    const { default: decompress } = await withTimeout(import("woff2-encoder/decompress"), 8000, "loading the woff2-encoder decompress module");
-    sfntBytes = await withTimeout(decompress(rawBytes), 8000, "decompressing WOFF2 to sfnt");
+      // Browser fetch() always gets WOFF2 back from Google (it can't
+      // override the User-Agent header, which is what Google sniffs to
+      // decide format — see the matching note in pdfExport.js), so this
+      // needs decompressing to a real sfnt to be embeddable in the PDF.
+      let sfntBytes = rawBytes;
+      if (format === "woff2") {
+        const { default: decompress } = await withTimeout(import("woff2-encoder/decompress"), 8000, "loading the woff2-encoder decompress module");
+        sfntBytes = await withTimeout(decompress(rawBytes), 8000, "decompressing WOFF2 to sfnt");
+      }
+      return { dataUrl: `data:font/ttf;base64,${bytesToBase64(sfntBytes)}`, unicodeRange };
+    })
+  );
+}
+
+// Makes a font usable in the editor's preview: one FontFace per part,
+// each limited to its unicode-range so the browser combines them.
+async function registerFontFaces(f) {
+  const parts = [{ dataUrl: f.dataUrl, unicodeRange: f.unicodeRange }, ...(f.extraParts || [])].filter((p) => p.dataUrl);
+  for (const p of parts) {
+    const face = new FontFace(f.family, `url(${p.dataUrl})`, p.unicodeRange ? { unicodeRange: p.unicodeRange } : {});
+    await face.load();
+    document.fonts.add(face);
   }
-
-  return `data:font/ttf;base64,${bytesToBase64(sfntBytes)}`;
 }
 
 // ---------------------------------------------------------------------
@@ -713,6 +715,9 @@ function inflateTemplate(data) {
     filename: (meta.path || "").split("/").pop() || "font.ttf",
     dataUrl: meta.data_url || null,
     needsReupload: !meta.data_url,
+    library: !!meta.library,
+    unicodeRange: meta.unicode_range || null,
+    extraParts: (meta.extra_parts || []).map((p) => ({ dataUrl: p.data_url, unicodeRange: p.unicode_range || null })),
   }));
 
   let maxN = 0;
@@ -818,6 +823,7 @@ export default function BadgeDesigner() {
   const [panning, setPanning] = useState(false);
   const [compIdInput, setCompIdInput] = useState("");
   const [showCompMenu, setShowCompMenu] = useState(false);
+  const [showPageMenu, setShowPageMenu] = useState(false); // page settings, on narrow windows
   const [draggingFieldId, setDraggingFieldId] = useState(null); // layers list drag & drop
   // Ids of fields reaching past the safe margin, measured from what's
   // actually drawn (so auto-width text, alignment and rotation all count).
@@ -1656,30 +1662,34 @@ export default function BadgeDesigner() {
   const renameFontDisplay = (id, displayName) => setState((s) => ({ ...s, fonts: s.fonts.map((f) => (f.id === id ? { ...f, displayName } : f)) }), `fontname:${id}`);
   const removeFont = (id) => setState((s) => ({ ...s, fonts: s.fonts.filter((f) => f.id !== id) }));
 
-  const [addingGoogleFont, setAddingGoogleFont] = useState(null); // preset.label currently being fetched, or null
-  const addGoogleFontPreset = async (preset) => {
-    setAddingGoogleFont(preset.label);
+  // A font from the library (fontLibrary.js), downloaded the first time
+  // it's picked and from then on stored in the template like an uploaded
+  // one. Resolves to its family name (field.font), or null if it failed.
+  const loadLibraryFont = async (entry) => {
+    const family = libraryFamily(entry);
+    if (state.fonts.some((f) => f.family === family)) return family;
     try {
-      const dataUrl = await fetchGoogleFontFamilyDataUrl(preset.family, preset.weight);
-      const family = `custom-${preset.label.replace(/\s+/g, "")}-${uid("f")}`.replace(/[^a-zA-Z0-9_-]/g, "");
-      try {
-        const face = new FontFace(family, `url(${dataUrl})`);
-        await face.load();
-        document.fonts.add(face);
-      } catch (err) {
-        console.error("Font failed to load", err);
-      }
-      setState((s) => ({ ...s, fonts: [...s.fonts, { id: uid("font"), family, displayName: preset.label, filename: `${preset.family}-${preset.weight}.ttf`, dataUrl }] }));
+      const [main, ...extra] = await fetchGoogleFontParts(entry.family, String(entry.weight));
+      const font = {
+        id: uid("font"),
+        family,
+        displayName: entry.label,
+        filename: `${entry.family.replace(/\s+/g, "")}-${entry.weight}.ttf`,
+        dataUrl: main.dataUrl,
+        unicodeRange: main.unicodeRange,
+        // further parts of the font (latin-ext), see fetchGoogleFontParts
+        extraParts: extra,
+        library: true,
+      };
+      await registerFontFaces(font);
+      setState((s) => (s.fonts.some((f) => f.family === family) ? s : { ...s, fonts: [...s.fonts, font] }));
+      return family;
     } catch (e) {
-      console.error(`Could not fetch "${preset.label}" from Google Fonts`, e);
-      alert(`Could not fetch "${preset.label}" from Google Fonts. Check your network connection and try again.`);
-    } finally {
-      setAddingGoogleFont(null);
+      console.error(`Could not fetch "${entry.label}" from Google Fonts`, e);
+      alert(`Could not download "${entry.label}". Check your internet connection and try again.`);
+      return null;
     }
   };
-
-  const allFontOptions = [...BUILTIN_FONTS, ...state.fonts.map((f) => f.family)];
-  const fontLabel = (family) => state.fonts.find((f) => f.family === family)?.displayName || family;
 
   const applyPreset = (preset) => {
     if (preset.w == null) return;
@@ -1746,7 +1756,14 @@ export default function BadgeDesigner() {
 
     const fontsManifest = {};
     state.fonts.forEach((f) => {
-      fontsManifest[f.family] = { display_name: f.displayName, path: `assets/fonts/${f.filename}`, data_url: f.dataUrl || null };
+      fontsManifest[f.family] = {
+        display_name: f.displayName,
+        path: `assets/fonts/${f.filename}`,
+        data_url: f.dataUrl || null,
+        ...(f.library ? { library: true } : {}),
+        ...(f.unicodeRange ? { unicode_range: f.unicodeRange } : {}),
+        ...(f.extraParts?.length ? { extra_parts: f.extraParts.map((p) => ({ data_url: p.dataUrl, unicode_range: p.unicodeRange })) } : {}),
+      };
     });
 
     const out = {
@@ -1816,9 +1833,7 @@ export default function BadgeDesigner() {
         for (const f of next.fonts) {
           if (f.dataUrl) {
             try {
-              const face = new FontFace(f.family, `url(${f.dataUrl})`);
-              await face.load();
-              document.fonts.add(face);
+              await registerFontFaces(f);
               f.needsReupload = false;
             } catch (err) {
               console.error("Font failed to load on import", err);
@@ -1909,13 +1924,49 @@ export default function BadgeDesigner() {
 
   const iconButton = "p-1.5 rounded-md text-neutral-600 hover:bg-neutral-100 disabled:opacity-30 disabled:hover:bg-transparent";
 
+  const pageControls = (
+    <>
+      <select
+        onChange={(e) => applyPreset(PAGE_PRESETS[Number(e.target.value)])}
+        value={String(PAGE_PRESETS.findIndex((p) => p.w === sideData.page.width_mm && p.h === sideData.page.height_mm))}
+        className="text-xs px-1.5 py-1 border border-neutral-300 rounded-md text-neutral-700 max-w-40"
+        title="Page size"
+      >
+        <option value="-1" disabled>
+          Custom size
+        </option>
+        {PAGE_PRESETS.filter((p) => p.w != null).map((p) => (
+          <option key={p.label} value={PAGE_PRESETS.indexOf(p)}>
+            {p.label}
+          </option>
+        ))}
+      </select>
+      <input type="number" step="0.5" value={sideData.page.width_mm} onChange={(e) => updateSide({ page: { ...sideData.page, width_mm: Number(e.target.value) } }, `page:${side}:w`)} className="w-14 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" title="Width (mm)" />
+      <span>×</span>
+      <input type="number" step="0.5" value={sideData.page.height_mm} onChange={(e) => updateSide({ page: { ...sideData.page, height_mm: Number(e.target.value) } }, `page:${side}:h`)} className="w-14 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" title="Height (mm)" />
+      <span>mm</span>
+      <span className="ml-2" title="Safe margin: a guide drawn this far inside every edge while designing. Not printed.">
+        Margin
+      </span>
+      <input
+        type="number"
+        min={0}
+        step={0.5}
+        value={sideData.safeMarginMm}
+        onChange={(e) => updateSide({ safeMarginMm: clamp(Number(e.target.value) || 0, 0, Math.min(sideData.page.width_mm, sideData.page.height_mm) / 2) }, `margin:${side}`)}
+        className="w-12 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800"
+        title="Safe margin (mm) — guide only, not printed"
+      />
+    </>
+  );
+
   return (
     <div className="w-full h-screen bg-neutral-100 text-neutral-900 flex flex-col overflow-hidden" style={{ fontFamily: "system-ui, sans-serif" }}>
       {/* ---------- top bar ---------- */}
-      <div className="h-12 shrink-0 flex items-center gap-2 px-3 bg-white border-b border-neutral-200">
+      <div className="h-12 shrink-0 flex items-center gap-2 px-3 bg-white border-b border-neutral-200 [&>*]:shrink-0">
         <button onClick={() => setShowAbout(true)} className="flex items-center gap-1.5 pr-2 mr-1 border-r border-neutral-200 font-semibold text-sm hover:text-blue-700" title="About and credits">
-          <BadgeCheck size={18} className="text-blue-600" />
-          <span className="hidden md:inline whitespace-nowrap">Competition Badge Generator</span>
+          <Logo size={22} />
+          <span className="hidden xl:inline whitespace-nowrap">Competition Badge Generator</span>
         </button>
         <button onClick={undo} disabled={!canUndo} className={iconButton} title="Undo (Ctrl+Z)">
           <Undo2 size={16} />
@@ -1924,7 +1975,7 @@ export default function BadgeDesigner() {
           <Redo2 size={16} />
         </button>
         <div className="w-px h-6 bg-neutral-200 mx-1" />
-        <div className="flex rounded-md overflow-hidden border border-neutral-300 text-sm">
+        <div className="flex rounded-md overflow-hidden border border-neutral-300 text-sm whitespace-nowrap">
           {["front", "back"].map((s) => (
             <button
               key={s}
@@ -1947,47 +1998,27 @@ export default function BadgeDesigner() {
           </button>
         </div>
 
-        {/* page of the side shown: size and safe margin */}
-        <div className="hidden md:flex items-center gap-1.5 text-xs text-neutral-500 ml-1">
-          <select
-            onChange={(e) => applyPreset(PAGE_PRESETS[Number(e.target.value)])}
-            value={String(PAGE_PRESETS.findIndex((p) => p.w === sideData.page.width_mm && p.h === sideData.page.height_mm))}
-            className="text-xs px-1.5 py-1 border border-neutral-300 rounded-md text-neutral-700 max-w-40"
-            title="Page size"
-          >
-            <option value="-1" disabled>
-              Custom size
-            </option>
-            {PAGE_PRESETS.filter((p) => p.w != null).map((p) => (
-              <option key={p.label} value={PAGE_PRESETS.indexOf(p)}>
-                {p.label}
-              </option>
-            ))}
-          </select>
-          <input type="number" step="0.5" value={sideData.page.width_mm} onChange={(e) => updateSide({ page: { ...sideData.page, width_mm: Number(e.target.value) } }, `page:${side}:w`)} className="w-14 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" title="Width (mm)" />
-          <span>×</span>
-          <input type="number" step="0.5" value={sideData.page.height_mm} onChange={(e) => updateSide({ page: { ...sideData.page, height_mm: Number(e.target.value) } }, `page:${side}:h`)} className="w-14 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" title="Height (mm)" />
-          <span>mm</span>
-          <span className="ml-2" title="Safe margin: a guide drawn this far inside every edge while designing. Not printed.">
-            Margin
-          </span>
-          <input
-            type="number"
-            min={0}
-            step={0.5}
-            value={sideData.safeMarginMm}
-            onChange={(e) => updateSide({ safeMarginMm: clamp(Number(e.target.value) || 0, 0, Math.min(sideData.page.width_mm, sideData.page.height_mm) / 2) }, `margin:${side}`)}
-            className="w-12 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800"
-            title="Safe margin (mm) — guide only, not printed"
-          />
+        {/* page of the side shown: size and safe margin — inline where it
+            fits, behind a "Page" button on narrower windows */}
+        <div className="hidden xl:flex items-center gap-1.5 text-xs text-neutral-500 ml-1">{pageControls}</div>
+        <div className="relative xl:hidden">
+          <button onClick={() => setShowPageMenu((v) => !v)} className={`${iconButton} flex items-center gap-1.5 text-sm px-2.5`} title="Page size and margin">
+            <Ruler size={15} /> Page
+          </button>
+          {showPageMenu && (
+            <>
+              <div className="fixed inset-0 z-30" onPointerDown={() => setShowPageMenu(false)} />
+              <div className="absolute left-0 top-full mt-1.5 z-40 bg-white rounded-lg shadow-xl border border-neutral-200 p-3 flex flex-wrap items-center gap-1.5 text-xs text-neutral-500 w-[23rem]">{pageControls}</div>
+            </>
+          )}
         </div>
 
         <div className="flex-1" />
 
-        <div className="relative">
+        <div className="relative !shrink min-w-0">
           <button
             onClick={() => setShowCompMenu((v) => !v)}
-            className={`hidden sm:flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-md max-w-64 ${state.wcif ? "bg-emerald-50 text-emerald-800 hover:bg-emerald-100" : "bg-amber-50 text-amber-800 hover:bg-amber-100"}`}
+            className={`hidden sm:flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-md max-w-64 w-full ${state.wcif ? "bg-emerald-50 text-emerald-800 hover:bg-emerald-100" : "bg-amber-50 text-amber-800 hover:bg-amber-100"}`}
             title={state.wcif ? "Competition loaded — click to load another" : "Load a competition"}
           >
             <Trophy size={13} className="shrink-0" />
@@ -2228,7 +2259,7 @@ export default function BadgeDesigner() {
               )}
 
               {activeTab === "fonts" && (
-                <FontsPanel fonts={state.fonts} onUpload={uploadFont} onRename={renameFontDisplay} onRemove={removeFont} onAddGooglePreset={addGoogleFontPreset} addingGoogleFont={addingGoogleFont} />
+                <FontsPanel fonts={state.fonts} onUpload={uploadFont} onRename={renameFontDisplay} onRemove={removeFont} />
               )}
 
               {activeTab === "data" && <DataPanel sampleData={state.sampleData} updateSampleValue={updateSampleValue} addSampleKey={addSampleKey} removeSampleKey={removeSampleKey} />}
@@ -2341,8 +2372,8 @@ export default function BadgeDesigner() {
             <PropertiesPanel
               field={selectedField}
               sampleData={state.sampleData}
-              fontOptions={allFontOptions}
-              fontLabel={fontLabel}
+              fonts={state.fonts}
+              loadLibraryFont={loadLibraryFont}
               pageWidth={sideData.page.width_mm}
               pageHeight={sideData.page.height_mm}
               onChange={(patch) => updateField(selectedField.id, patch)}
@@ -3243,74 +3274,54 @@ function StageColorsPanel({ stages, stageColors, onChange }) {
   );
 }
 
-function FontsPanel({ fonts, onUpload, onRename, onRemove, onAddGooglePreset, addingGoogleFont }) {
+// The fonts this template carries: imported ones (uploaded files) and the
+// ones picked from the font library, each name shown in its own font.
+function FontsPanel({ fonts, onUpload, onRename, onRemove }) {
   const onFile = (e) => {
     const file = e.target.files?.[0];
     if (file) onUpload(file);
     e.target.value = "";
   };
-  const addedPresetLabels = new Set(fonts.map((f) => f.displayName));
-  return (
-    <div className="p-4 space-y-3 border-t border-neutral-200 overflow-y-auto">
-      <div className="text-xs font-semibold text-neutral-500 flex items-center gap-1.5">
-        <Type size={12} /> CUSTOM FONTS
-      </div>
-      <div className="text-[11px] text-neutral-400">Upload .ttf, .otf or .woff files. Each becomes selectable in any text field's font picker.</div>
-      <label className="flex items-center justify-center gap-1.5 text-sm px-3 py-2 border border-dashed border-neutral-300 rounded-md cursor-pointer hover:bg-neutral-50 text-neutral-600">
-        <Upload size={14} />
-        Upload font file
-        <input type="file" accept=".ttf,.otf,.woff,.woff2" className="hidden" onChange={onFile} />
-      </label>
-
-      {onAddGooglePreset && (
-        <div>
-          <div className="text-[11px] text-neutral-400 mb-1.5">Or add straight from Google Fonts — no download/upload needed:</div>
-          <div className="flex flex-wrap gap-1.5">
-            {GOOGLE_FONT_PRESETS.map((preset) => {
-              const added = addedPresetLabels.has(preset.label);
-              const loading = addingGoogleFont === preset.label;
-              return (
-                <button
-                  key={preset.label}
-                  onClick={() => onAddGooglePreset(preset)}
-                  disabled={added || loading || !!addingGoogleFont}
-                  className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 border border-neutral-300 rounded-md hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <span style={{ fontWeight: preset.weight === "700" ? 700 : 400 }}>{preset.label}</span>
-                  {added ? <span className="text-neutral-400">— added</span> : loading ? <span className="text-neutral-400">— fetching…</span> : <Plus size={11} className="text-blue-600" />}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      <div className="space-y-2">
-        {fonts.map((f) => (
-          <div key={f.id} className="border border-neutral-200 rounded-md p-2">
-            <div className="flex items-center gap-1.5">
-              <input value={f.displayName} onChange={(e) => onRename(f.id, e.target.value)} className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0" />
-              <button onClick={() => onRemove(f.id)} className="text-neutral-400 hover:text-red-500">
-                <Trash2 size={13} />
-              </button>
-            </div>
-            {f.needsReupload ? (
-              <div className="text-[10px] text-amber-600 mt-1.5">Imported — re-upload this file to render it here again.</div>
-            ) : (
-              <div style={{ fontFamily: `"${f.family}", sans-serif` }} className="text-lg mt-1.5 truncate">
-                The quick brown fox
-              </div>
-            )}
-            <div className="text-[10px] text-neutral-400 mt-0.5 truncate">{f.filename}</div>
+  const group = (title, list, empty) => (
+    <div>
+      <div className="text-[11px] font-semibold uppercase tracking-wide text-neutral-400 mb-1.5">{title}</div>
+      <div className="space-y-1">
+        {list.map((f) => (
+          <div key={f.id} className="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-neutral-50">
+            <input
+              value={f.displayName}
+              onChange={(e) => onRename(f.id, e.target.value)}
+              title="Rename"
+              className="flex-1 min-w-0 bg-transparent text-[15px] outline-none focus:ring-1 focus:ring-blue-300 rounded px-1 -mx-1"
+              style={f.needsReupload ? undefined : { fontFamily: `"${f.family}", sans-serif` }}
+            />
+            {f.needsReupload && <span className="text-[10px] text-amber-600 shrink-0" title="This template didn't carry the font file — upload it again">missing</span>}
+            <button onClick={() => onRemove(f.id)} className="text-neutral-300 hover:text-red-500 shrink-0 opacity-0 group-hover:opacity-100" title="Remove">
+              <Trash2 size={13} />
+            </button>
           </div>
         ))}
-        {fonts.length === 0 && <div className="text-xs text-neutral-400">No custom fonts uploaded yet.</div>}
+        {list.length === 0 && <div className="text-xs text-neutral-400 px-2">{empty}</div>}
       </div>
+    </div>
+  );
+  return (
+    <div className="p-4 space-y-5">
+      <div className="text-[11px] text-neutral-500 leading-relaxed">
+        Pick fonts in a text's properties: the standard ones, any of the library (downloaded the first time), or your own. The ones in use travel inside the template.
+      </div>
+      {group("Imported", fonts.filter((f) => !f.library), "None yet — upload a .ttf, .otf or .woff file below.")}
+      <label className="flex items-center justify-center gap-1.5 text-sm px-3 py-2 border border-dashed border-neutral-300 rounded-md cursor-pointer hover:bg-neutral-50 text-neutral-600">
+        <Upload size={14} />
+        Import font file
+        <input type="file" accept=".ttf,.otf,.woff,.woff2" className="hidden" onChange={onFile} />
+      </label>
+      {group("From the library", fonts.filter((f) => f.library), "None yet — choose one in a text's font picker.")}
     </div>
   );
 }
 
-function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth, pageHeight, onChange, scheduleTimezone, detectedScheduleTimezone, onScheduleTimezoneChange, onSyncCountryFlags, hasWcif }) {
+function PropertiesPanel({ field, sampleData, fonts, loadLibraryFont, pageWidth, pageHeight, onChange, scheduleTimezone, detectedScheduleTimezone, onScheduleTimezoneChange, onSyncCountryFlags, hasWcif }) {
   const round1 = (v) => Math.round(v * 10) / 10;
   const fieldHeightMm = () => {
     if (field.type === "schedule") {
@@ -3505,18 +3516,7 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
             <TextFrameOptions
               field={field}
               onChange={onChange}
-              fontSelect={
-                <div>
-                  <div className="text-[11px] text-neutral-500 mb-1">Font</div>
-                  <select value={field.font} onChange={(e) => onChange({ font: e.target.value })} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md">
-                    {fontOptions.map((f) => (
-                      <option key={f} value={f}>
-                        {fontLabel(f)}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              }
+              fontSelect={<FontPicker value={field.font} fonts={fonts} onChange={(font) => onChange({ font })} loadLibraryFont={loadLibraryFont} />}
             />
           ) : (
             <>
@@ -3546,16 +3546,7 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
                   : "Set a box height (0 = none) to align the text vertically inside it."}
               </div>
 
-              <div>
-                <div className="text-[11px] text-neutral-500 mb-1">Font</div>
-                <select value={field.font} onChange={(e) => onChange({ font: e.target.value })} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md">
-                  {fontOptions.map((f) => (
-                    <option key={f} value={f}>
-                      {fontLabel(f)}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              <FontPicker value={field.font} fonts={fonts} onChange={(font) => onChange({ font })} loadLibraryFont={loadLibraryFont} />
               <div className="flex items-center gap-3 text-xs">
                 <label className="flex items-center gap-1.5">
                   <input type="radio" checked={field.fontMode === "fixed"} onChange={() => onChange({ fontMode: "fixed" })} />
