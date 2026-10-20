@@ -5,6 +5,7 @@ import { buildCompetitorSchedules, buildStageList } from "./schedule.js";
 import { applyTextCase, layoutTextFrame } from "./textLayout.js";
 import { isFullCrop, placeImage } from "./imageCrop.js";
 import { personRole as matchPersonRole } from "./roles.js";
+import { pickMappedLabel } from "./valueMap.js";
 
 const MM_TO_PT = 2.834645669;
 const mmv = (v) => v * MM_TO_PT;
@@ -124,10 +125,13 @@ function resolveTextValue(field, ctx) {
   if (field.bindMode === "static") return normText(field.staticText ?? field.text ?? "");
   if (field.bindMode === "template") return resolveTemplateStr(field.template, ctx);
   const raw = ctx[field.source];
-  const valueMap = field.valueMap || field.value_map;
+  // Only when "Map displayed value" is on (useValueMap is undefined for a
+  // field taken straight from an exported template, where value_map is
+  // only present when it was on).
+  const valueMap = field.useValueMap === false ? null : field.valueMap || field.value_map;
   if (valueMap) {
     const found = valueMap.find((m) => m.value === raw);
-    if (found) return normText(found.label);
+    if (found) return normText(pickMappedLabel(found, ctx.gender, field.genderVariants ?? field.gender_variants));
   }
   return raw === undefined || raw === null ? "" : normText(String(raw));
 }
@@ -1114,6 +1118,7 @@ function buildPersonContext(person, sampleData, competitorSchedules, stages, rol
     wcaId: person.wcaId || "",
     registrantId: regId !== undefined && regId !== null && regId !== person.wcaId ? String(regId) : "",
     countryIso2: person.countryIso2 || "",
+    gender: person.gender || "",
     schedules: competitorSchedules[String(regId)] || {},
     stages,
   });

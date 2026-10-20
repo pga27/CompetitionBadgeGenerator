@@ -33,6 +33,7 @@ import defaultTemplate from "./defaultTemplate.json";
 import { applyTextCase, DEFAULT_FRAME, layoutTextFrame, shrinkToWidth } from "./textLayout.js";
 import { FULL_CROP, isFullCrop, normalizeCrop, placeImage } from "./imageCrop.js";
 import { addRolesFromPersons, countByRule } from "./roles.js";
+import { pickMappedLabel } from "./valueMap.js";
 
 const SCALE = 5.2; // px per mm
 const MIN_MM = 4;
@@ -444,7 +445,7 @@ function resolveTextValue(field, sampleData) {
   let value = raw;
   if (field.useValueMap) {
     const found = (field.valueMap || []).find((m) => m.value === raw);
-    value = found ? found.label : raw;
+    value = found ? pickMappedLabel(found, sampleData.gender, field.genderVariants) : raw;
   }
   return (field.customPrefix || "") + value;
 }
@@ -500,6 +501,7 @@ function textFieldDefaults() {
     template: "",
     useValueMap: false,
     valueMap: [],
+    genderVariants: false,
     font: "Helvetica",
     fontMode: "fixed",
     size: 10,
@@ -538,6 +540,7 @@ function inflateTextField(f) {
     template: f.template || "",
     useValueMap: !!f.value_map,
     valueMap: f.value_map || [],
+    genderVariants: !!f.gender_variants,
     font: f.font || "Helvetica",
     color: f.color || "#141414",
     align: f.align || "left",
@@ -680,7 +683,8 @@ function inflateTemplate(data) {
   uidCounter = Math.max(uidCounter, maxN + 1);
 
   return {
-    sampleData: data.sample_data || { name: "Sample Name" },
+    // gender: WCIF "m" / "f" / "o", for gender variants of mapped text.
+    sampleData: { ...(data.sample_data || { name: "Sample Name" }), gender: data.sample_data?.gender ?? "m" },
     scheduleTimezone: data.schedule_timezone || "",
     // A template saved before this feature existed won't have role_mapping
     // at all — default reproduces the old hardcoded organizer/delegate
@@ -1165,7 +1169,7 @@ export default function BadgeDesigner() {
             out.template = f.template;
           } else {
             out.source = f.source;
-            if (f.useValueMap) Object.assign(out, { value_map: f.valueMap });
+            if (f.useValueMap) Object.assign(out, { value_map: f.valueMap, ...(f.genderVariants ? { gender_variants: true } : {}) });
           }
           Object.assign(out, { font: f.font, color: f.color, align: f.align || "left", letter_spacing: f.letterSpacing || 0, wrap: !!f.wrap });
           if (f.wrap) Object.assign(out, { w_mm: f.w_mm, break_style: f.breakStyle, line_height: f.lineHeight || 1.05 });
@@ -2616,15 +2620,37 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
               </label>
               {field.useValueMap && (
                 <div>
-                  <div className="text-[11px] text-neutral-500 mb-1">Raw value → displayed text (unmapped values show as-is). Enter for a line break in the display text.</div>
+                  <label className="flex items-center gap-1.5 text-xs text-neutral-600 mb-1.5">
+                    <input type="checkbox" checked={!!field.genderVariants} onChange={(e) => onChange({ genderVariants: e.target.checked })} />
+                    Different text by gender
+                  </label>
+                  <div className="text-[11px] text-neutral-500 mb-1">
+                    Raw value → displayed text (unmapped values show as-is). Enter for a line break in the display text.
+                    {field.genderVariants && " F / M: text for women / men (WCIF gender); left empty, or for gender \"o\", the main text is used."}
+                  </div>
                   <div className="space-y-1.5">
                     {(field.valueMap || []).map((m, i) => (
-                      <div key={i} className="flex items-start gap-1.5">
-                        <input value={m.value} onChange={(e) => updateValueMap(i, { value: e.target.value })} placeholder="raw value" className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0" />
-                        <textarea value={m.label} onChange={(e) => updateValueMap(i, { label: e.target.value })} placeholder="display text" rows={1} className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0 resize-y" />
-                        <button onClick={() => removeValueMap(i)} className="text-neutral-400 hover:text-red-500 mt-1">
-                          <Trash2 size={12} />
-                        </button>
+                      <div key={i} className={field.genderVariants ? "space-y-1 pb-1.5 border-b border-neutral-100" : ""}>
+                        <div className="flex items-start gap-1.5">
+                          <input value={m.value} onChange={(e) => updateValueMap(i, { value: e.target.value })} placeholder="raw value" className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0" />
+                          <textarea value={m.label} onChange={(e) => updateValueMap(i, { label: e.target.value })} placeholder="display text" rows={1} className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0 resize-y" />
+                          <button onClick={() => removeValueMap(i)} className="text-neutral-400 hover:text-red-500 mt-1">
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                        {field.genderVariants && (
+                          <div className="flex items-center gap-1.5 pr-5">
+                            {[
+                              ["label_f", "F"],
+                              ["label_m", "M"],
+                            ].map(([key, tag]) => (
+                              <label key={key} className="flex-1 flex items-center gap-1 min-w-0">
+                                <span className="text-[10px] font-semibold text-neutral-400 w-3">{tag}</span>
+                                <input value={m[key] || ""} onChange={(e) => updateValueMap(i, { [key]: e.target.value })} placeholder={m.label} className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0" />
+                              </label>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
