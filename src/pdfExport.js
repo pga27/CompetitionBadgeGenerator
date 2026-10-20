@@ -2,6 +2,10 @@ import { PDFDocument, rgb, StandardFonts, pushGraphicsState, popGraphicsState, c
 import fontkit from "@pdf-lib/fontkit";
 import QRCode from "qrcode";
 import { buildCompetitorSchedules, buildStageList } from "./schedule.js";
+import { applyTextCase, breakPoints, layoutTextFrame } from "./textLayout.js";
+import { isFullCrop, placeImage } from "./imageCrop.js";
+import { personRole as matchPersonRole } from "./roles.js";
+import { pickMappedLabel } from "./valueMap.js";
 
 const MM_TO_PT = 2.834645669;
 const mmv = (v) => v * MM_TO_PT;
@@ -121,10 +125,13 @@ function resolveTextValue(field, ctx) {
   if (field.bindMode === "static") return normText(field.staticText ?? field.text ?? "");
   if (field.bindMode === "template") return resolveTemplateStr(field.template, ctx);
   const raw = ctx[field.source];
-  const valueMap = field.valueMap || field.value_map;
+  // Only when "Map displayed value" is on (useValueMap is undefined for a
+  // field taken straight from an exported template, where value_map is
+  // only present when it was on).
+  const valueMap = field.useValueMap === false ? null : field.valueMap || field.value_map;
   if (valueMap) {
     const found = valueMap.find((m) => m.value === raw);
-    if (found) return normText(found.label);
+    if (found) return normText(pickMappedLabel(found, ctx.gender, field.genderVariants ?? field.gender_variants));
   }
   return raw === undefined || raw === null ? "" : normText(String(raw));
 }
@@ -326,10 +333,11 @@ function wrapLines(fonts, preferredFont, text, size, maxWidthPt, breakStyle) {
       lines.push("");
       continue;
     }
-    const tokens = breakStyle === "break-all" ? paragraph.split("") : paragraph.split(" ");
-    const sep = breakStyle === "break-all" ? "" : " ";
+    // break-word: at spaces and after hyphens, like the browser preview
+    // (see breakPoints in textLayout.js).
+    const tokens = breakStyle === "break-all" ? paragraph.split("").map((ch) => ({ text: ch, sep: "" })) : breakPoints(paragraph);
     let current = "";
-    for (const token of tokens) {
+    for (const { text: token, sep } of tokens) {
       const trial = current ? current + sep + token : token;
       if (widthOf(trial) <= maxWidthPt || !current) {
         current = trial;
@@ -350,13 +358,38 @@ function wrapLines(fonts, preferredFont, text, size, maxWidthPt, breakStyle) {
 // applied — every draw*Field function below just draws at a plain anchor
 // and never touches field.rotate itself).
 function drawTextField(page, field, ctx, fonts, originX, originY) {
-  const value = resolveTextValue(field, ctx);
+  const value = applyTextCase(resolveTextValue(field, ctx), field.textCase);
   const isBold = (field.font || "").includes("Bold");
   const isCustom = fonts.custom[field.font];
   const preferredFont = isCustom || (isBold ? fonts.helveticaBold : fonts.helvetica);
-  const color = hexToRgb01(field.color || "#000000");
+  // Same rule as resolveTextColor in BadgeDesigner.jsx.
+  const colorMap = field.colorMap;
+  const color = hexToRgb01(
+    (colorMap?.enabled ? resolveMappingColor({ mapSource: colorMap.source, mappings: colorMap.mappings, fallbackColor: field.color }, ctx) : field.color) || "#000000"
+  );
   const align = field.align || "left";
   const letterSpacing = field.letterSpacing || field.letter_spacing || 0;
+
+  if (field.textKind === "frame") {
+    // Text frame: the shared layout engine (textLayout.js) picks the size
+    // and line breaks; lines are aligned inside the frame's inner box.
+    const measure = (s, size) => planWidth(buildCharPlan(fonts, preferredFont, s, size), letterSpacing);
+    // Cap height (as a fraction of the size) for centering by the letters:
+    // from the font itself for uploaded fonts, Helvetica's 718/1000 otherwise.
+    const fk = preferredFont.fontkitFont;
+    const capHeight = fk && fk.capHeight > 0 ? fk.capHeight / fk.unitsPerEm : 0.718;
+    const layout = layoutTextFrame(value, field.frame, { measure, lineHeight: field.lineHeight || 1.05, breakStyle: field.breakStyle || "break-word", fixedSize: field.size || 12, capHeight });
+    layout.lines.forEach((line, i) => {
+      const plan = buildCharPlan(fonts, preferredFont, line, layout.size);
+      const textW = planWidth(plan, letterSpacing);
+      let offset = 0;
+      if (align === "center") offset = (layout.innerW - textW) / 2;
+      else if (align === "right") offset = layout.innerW - textW;
+      drawCharPlan(page, plan, originX + layout.padding + offset, originY - layout.padding - layout.baselines[i], layout.size, letterSpacing, color);
+    });
+    return;
+  }
+
   const isWrap = !!field.wrap;
   const boxW = isWrap ? mmv(field.w_mm || 60) : null;
 
@@ -389,19 +422,24 @@ function drawTextField(page, field, ctx, fonts, originX, originY) {
     drawCharPlan(page, plan, originX + offset, baselineY, size, letterSpacing, color);
   };
 
-  if (isWrap) {
-    const lines = wrapLines(fonts, preferredFont, value, size, boxW, field.breakStyle || field.break_style || "break-word");
-    const lineHeightPt = size * (field.lineHeight || field.line_height || 1.05);
-    lines.forEach((line, i) => drawLine(line, originY - i * lineHeightPt));
-  } else {
-    // Not wrapped to a box width, but an explicit "\n" (e.g. from a
-    // static/template textarea, or a value-map label) should still break
-    // into multiple lines — "wrap" only controls automatic word-wrap to
-    // fit boxW, it shouldn't gate hard line breaks.
-    const rawLines = value.split("\n");
-    const lineHeightPt = size * (field.lineHeight || field.line_height || 1.05);
-    rawLines.forEach((line, i) => drawLine(line, originY - i * lineHeightPt));
+  // Not wrapped to a box width, an explicit "\n" (e.g. from a static/
+  // template textarea, or a value-map label) still breaks into multiple
+  // lines — "wrap" only controls automatic word-wrap to fit boxW, it
+  // shouldn't gate hard line breaks.
+  const lines = isWrap ? wrapLines(fonts, preferredFont, value, size, boxW, field.breakStyle || field.break_style || "break-word") : value.split("\n");
+  const lineHeightPt = size * (field.lineHeight || field.line_height || 1.05);
+
+  // Optional box height: the text block sits at the top, middle or bottom
+  // of it, like text in a spreadsheet cell (same rule as FieldBox).
+  const boxHeightMm = field.boxHeightMm ?? field.box_height_mm ?? 0;
+  let offsetY = 0;
+  if (boxHeightMm > 0) {
+    const free = mmv(boxHeightMm) - lines.length * lineHeightPt;
+    const vAlign = field.vAlign || field.v_align || "top";
+    if (vAlign === "middle") offsetY = free / 2;
+    else if (vAlign === "bottom") offsetY = free;
   }
+  lines.forEach((line, i) => drawLine(line, originY - offsetY - i * lineHeightPt));
 }
 
 async function drawImageField(page, field, ctx, pdfDoc, imageCache, originX, originY) {
@@ -415,32 +453,44 @@ async function drawImageField(page, field, ctx, pdfDoc, imageCache, originX, ori
 
   const boxW = mmv(field.w_mm);
   const boxH = mmv(field.h_mm);
+  const fit = field.fit || "contain";
 
-  const embedded = await embedImageCached(pdfDoc, src, imageCache, { width: boxW, height: boxH });
+  // Cropped (or filled, which trims to the box's shape): cut the needed
+  // part out of the source first, then draw that. Plain "fit the whole
+  // image" keeps embedding the original as-is.
+  let drawSrc = src;
+  let place = null;
+  if (!isFullCrop(field.crop) || fit !== "contain") {
+    const img = await loadImageEl(src);
+    const imgW = img.naturalWidth || 512;
+    const imgH = img.naturalHeight || 512;
+    place = placeImage(imgW, imgH, field.crop, fit, boxW, boxH);
+    drawSrc = await cropImageCached(img, src, place, imageCache);
+  }
+
+  const embedded = await embedImageCached(pdfDoc, drawSrc, imageCache, { width: boxW, height: boxH });
   if (!embedded) return;
 
-  // Match the designer canvas's `object-contain` rendering (see FieldBox's
-  // "w-full h-full object-contain" for image fields): scale the image to
-  // fit inside the field's box while preserving its own aspect ratio, then
-  // center it in the box. Drawing at boxW x boxH directly (the old
-  // behavior) stretches the image to the box's aspect ratio instead of the
-  // image's own, which is what made an image with an aspect ratio different
-  // from its field come out squashed/stretched compared to the template.
-  const imgAspect = embedded.width / embedded.height;
-  const boxAspect = boxW / boxH;
-  let w = boxW;
-  let h = boxH;
-  if (imgAspect > boxAspect) {
-    w = boxW;
-    h = boxW / imgAspect;
-  } else {
-    h = boxH;
-    w = boxH * imgAspect;
-  }
-  const x = originX + (boxW - w) / 2;
-  const y = originY - boxH + (boxH - h) / 2;
+  // Same placement as the designer canvas (see placeImage in imageCrop.js):
+  // with no crop and "contain", the whole image scaled to fit and centered.
+  if (!place) place = placeImage(embedded.width, embedded.height, null, fit, boxW, boxH);
+  page.drawImage(embedded, { x: originX + place.dx, y: originY - place.dy - place.dh, width: place.dw, height: place.dh });
+}
 
-  page.drawImage(embedded, { x, y, width: w, height: h });
+// Cuts place's source rectangle out of an image into a new data URL, at the
+// source's own resolution (vector sources: at print resolution for the size
+// they're drawn at). JPEG sources stay JPEG to keep file size down.
+async function cropImageCached(img, src, place, cache) {
+  const key = `crop::${src}::${[place.sx, place.sy, place.sw, place.sh, place.dw, place.dh].map((v) => v.toFixed(2)).join(",")}`;
+  if (cache.has(key)) return cache.get(key);
+  const isSvg = src.startsWith("data:image/svg+xml");
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(isSvg ? ptToRasterPx(place.dw) : place.sw));
+  canvas.height = Math.max(1, Math.round(isSvg ? ptToRasterPx(place.dh) : place.sh));
+  canvas.getContext("2d").drawImage(img, place.sx, place.sy, place.sw, place.sh, 0, 0, canvas.width, canvas.height);
+  const out = src.startsWith("data:image/jpeg") ? canvas.toDataURL("image/jpeg", 0.92) : canvas.toDataURL("image/png");
+  cache.set(key, out);
+  return out;
 }
 
 // PDF points -> raster pixels at a print-quality DPI. A vector source
@@ -542,6 +592,13 @@ function formatDayTitle(dateStr) {
   }
 }
 
+// Same rule as BadgeDesigner.jsx's isSpecialScheduleRow: WCIF rows are
+// classified by activityCode (so renamed breaks keep their styling), the
+// name check only covers rows without one.
+function isSpecialScheduleRow(r) {
+  return r.isSpecial || (!r.activityCode && /lunch|dinner|opening|awards|tutorial/i.test(r.event));
+}
+
 function drawScheduleField(page, field, ctx, fonts, originX, originY) {
   const x0 = originX;
   const wMm = field.w_mm;
@@ -594,9 +651,9 @@ function drawScheduleField(page, field, ctx, fonts, originX, originY) {
   const subY = topY - mmv(SCHEDULE_HEADER_H_MM);
   page.drawRectangle({ x: x0, y: subY - mmv(SCHEDULE_SUBHEADER_H_MM), width: w, height: mmv(SCHEDULE_SUBHEADER_H_MM), color: hexToRgb01(SCHEDULE_COLORS.subheaderBg) });
   const labelY = subY - mmv(SCHEDULE_SUBHEADER_H_MM) / 2;
-  centered("Time", x0 + timeW / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
-  centered("Event", x0 + timeW + (w - timeW - taskW) / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
-  centered("Task", x0 + w - taskW / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
+  centered(normText(field.columnLabels?.time || "Time"), x0 + timeW / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
+  centered(normText(field.columnLabels?.event || "Event"), x0 + timeW + (w - timeW - taskW) / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
+  centered(normText(field.columnLabels?.task || "Task"), x0 + w - taskW / 2, labelY, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
   hline(subY - mmv(SCHEDULE_SUBHEADER_H_MM), x0, x0 + w);
   vline(x0 + timeW, subY, subY - mmv(SCHEDULE_SUBHEADER_H_MM));
   vline(x0 + w - taskW, subY, subY - mmv(SCHEDULE_SUBHEADER_H_MM));
@@ -638,7 +695,7 @@ function drawScheduleField(page, field, ctx, fonts, originX, originY) {
     } else {
       const r = block.row;
       const rowH = mmv(SCHEDULE_ROW_H_MM);
-      const isSpecial = r.isSpecial || /lunch|dinner|opening|awards|tutorial/i.test(r.event);
+      const isSpecial = isSpecialScheduleRow(r);
 
       if (!isSpecial) {
         page.drawRectangle({ x: x0, y: rowTop - rowH, width: w, height: rowH, color: hexToRgb01(r.color || "#ffffff") });
@@ -647,7 +704,7 @@ function drawScheduleField(page, field, ctx, fonts, originX, originY) {
       centered(r.time, x0 + timeW / 2, rowTop - rowH / 2, fonts.helvetica, SCHEDULE_FONT_SIZE);
 
       if (isSpecial) {
-        const bg = /lunch|dinner/i.test(r.event) ? SCHEDULE_COLORS.lunchBg : SCHEDULE_COLORS.otherSpecialBg;
+        const bg = /lunch|dinner/i.test(r.activityCode || r.event) ? SCHEDULE_COLORS.lunchBg : SCHEDULE_COLORS.otherSpecialBg;
         page.drawRectangle({ x: x0 + timeW, y: rowTop - rowH, width: w - timeW, height: rowH, color: hexToRgb01(r.specialColor || bg) });
         centered(r.event.toUpperCase(), x0 + timeW + (w - timeW) / 2, rowTop - rowH / 2, fonts.helveticaBold, SCHEDULE_FONT_SIZE);
       } else {
@@ -676,7 +733,7 @@ function drawScheduleField(page, field, ctx, fonts, originX, originY) {
       vline(x0 + w - taskW, rowTop, bottomY);
       page.drawRectangle({ x: x0 + w - taskW, y: bottomY, width: taskW, height: h, borderColor: hexToRgb01(SCHEDULE_COLORS.border), borderWidth: 0.5 });
     } else {
-      const isSpecial = block.row.isSpecial || /lunch|dinner|opening|awards|tutorial/i.test(block.row.event);
+      const isSpecial = isSpecialScheduleRow(block.row);
       vline(x0 + timeW, rowTop, bottomY);
       if (!isSpecial) vline(x0 + w - taskW, rowTop, bottomY);
     }
@@ -1043,7 +1100,9 @@ async function drawBackground(page, sideTpl, ctx, pdfDoc, pageWMm, pageHMm, imag
 // array — first match wins, since a person can hold more than one role
 // at once and priority between them is a real choice (e.g. an organizer
 // who is also judging should probably badge as "organizer"). A person
-// matching no rule gets `fallback`. DEFAULT_ROLE_MAPPING below
+// matching no rule gets `fallback`. A rule can also name several roles
+// joined with "+" (e.g. "delegate+organizer"), matching people who have
+// all of them — see roles.js. DEFAULT_ROLE_MAPPING below
 // reproduces the old hardcoded behavior exactly, so existing
 // state/templates saved before this feature existed keep working
 // unchanged.
@@ -1056,12 +1115,7 @@ const DEFAULT_ROLE_MAPPING = {
 };
 
 function personRole(person, roleMapping) {
-  const roles = person.roles || [];
-  const mapping = roleMapping && roleMapping.rules ? roleMapping : DEFAULT_ROLE_MAPPING;
-  for (const rule of mapping.rules) {
-    if (rule.wcaRole && roles.includes(rule.wcaRole)) return rule.label || rule.wcaRole;
-  }
-  return mapping.fallback || "competitor";
+  return matchPersonRole(person, roleMapping && roleMapping.rules ? roleMapping : DEFAULT_ROLE_MAPPING);
 }
 
 function buildPersonContext(person, sampleData, competitorSchedules, stages, roleMapping) {
@@ -1073,6 +1127,7 @@ function buildPersonContext(person, sampleData, competitorSchedules, stages, rol
     wcaId: person.wcaId || "",
     registrantId: regId !== undefined && regId !== null && regId !== person.wcaId ? String(regId) : "",
     countryIso2: person.countryIso2 || "",
+    gender: person.gender || "",
     schedules: competitorSchedules[String(regId)] || {},
     stages,
   });
@@ -1117,8 +1172,13 @@ export async function generateBadgesPdf(state, wcif, onProgress) {
     }
   }
 
-  const competitorSchedules = buildCompetitorSchedules(wcif, state.scheduleTimezone || undefined);
-  const stages = buildStageList(wcif);
+  const competitorSchedules = buildCompetitorSchedules(wcif, state.scheduleTimezone || undefined, {
+    stageColors: state.stageColors || {},
+    labels: state.scheduleLabels || {},
+    mbldSubmission: state.mbldSubmission || {},
+    mergedRounds: state.mergedRounds || [],
+  });
+  const stages = buildStageList(wcif, state.stageColors || {});
 
   const persons = (wcif.persons || []).filter(
     (p) => (p.registration && p.registration.status === "accepted") || (!p.registration && p.roles && p.roles.length)

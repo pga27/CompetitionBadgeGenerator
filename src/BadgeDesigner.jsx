@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import {
   Type,
   Image as ImageIcon,
@@ -23,10 +23,17 @@ import {
   ChevronUp,
   ChevronDown,
   Users,
+  SwatchBook,
+  Crop,
+  TriangleAlert,
 } from "lucide-react";
-import { buildCompetitorSchedules, buildGenericSchedule, buildStageList, resolveScheduleTimezone } from "./schedule.js";
+import { buildCompetitorSchedules, buildGenericSchedule, buildStageList, listScheduleTexts, resolveScheduleTimezone } from "./schedule.js";
 import { generateBadgesPdf, downloadPdfBytes } from "./pdfExport.js";
 import defaultTemplate from "./defaultTemplate.json";
+import { applyTextCase, DEFAULT_FRAME, layoutTextFrame, shrinkToWidth } from "./textLayout.js";
+import { FULL_CROP, isFullCrop, normalizeCrop, placeImage } from "./imageCrop.js";
+import { addRolesFromPersons, countByRule } from "./roles.js";
+import { pickMappedLabel } from "./valueMap.js";
 
 const SCALE = 5.2; // px per mm
 const MIN_MM = 4;
@@ -34,6 +41,8 @@ const TINT_ID = "__tint__";
 const FONTS_ID = "__fonts__";
 const BGMAP_ID = "__bgmap__";
 const ROLEMAP_ID = "__rolemap__";
+const STAGECOLORS_ID = "__stagecolors__";
+const SCHEDULE_ID = "__schedule__";
 // Country flags, bundled into the project rather than fetched at runtime
 // — put one file per country under src/assets/flags/, named by its WCA
 // countryIso2 code (e.g. assets/flags/PT.svg, assets/flags/US.svg).
@@ -147,12 +156,14 @@ const BUILTIN_FONTS = ["Helvetica", "Helvetica-Bold"];
 // not where the real (auto-sized) field visually was.
 function fieldBoxWidthMm(field) {
   if (field.type === "qr") return field.size_mm || 16;
+  if (field.type === "text" && field.textKind === "frame") return field.frame.w_mm;
   if (field.type === "text") return field.wrap ? field.w_mm || 60 : 0;
   return field.w_mm || 20;
 }
 function fieldBoxHeightMm(field) {
   if (field.type === "qr") return field.size_mm || 16;
-  if (field.type === "text") return 0;
+  if (field.type === "text" && field.textKind === "frame") return field.frame.auto_height ? 0 : field.frame.h_mm;
+  if (field.type === "text") return field.boxHeightMm > 0 ? field.boxHeightMm : 0;
   return field.h_mm || 8;
 }
 
@@ -341,6 +352,13 @@ const SCHEDULE_FALLBACK_ROWS = [
   { time: "19:20", event: "Rubik's Nations Cup", task: null, isSpecial: true, specialColor: "#fbcfe8" },
 ];
 
+// Full-width "break" rows (lunch, awards…). Rows from a WCIF know this from
+// their activityCode, so renaming one (e.g. "Lunch" -> "Comida") keeps its
+// styling; the name check is only for the placeholder rows above.
+function isSpecialScheduleRow(r) {
+  return r.isSpecial || (!r.activityCode && /lunch|dinner|opening|awards|tutorial/i.test(r.event));
+}
+
 function formatDayTitle(dateStr) {
   try {
     const [y, m, d] = dateStr.split("-").map(Number);
@@ -386,6 +404,14 @@ function resolveMapping(field, sampleData, kind) {
   return found || null;
 }
 
+// A text field's color: its own, unless "Color depends on a value" is on
+// and the value it watches (e.g. role) has a color of its own.
+function resolveTextColor(field, data) {
+  const map = field.colorMap;
+  if (!map?.enabled) return field.color;
+  return resolveMapping({ mapSource: map.source, mappings: map.mappings, fallbackColor: field.color }, data, "color");
+}
+
 function isValidTimezone(tz) {
   if (!tz) return true; // empty = "auto", always valid
   try {
@@ -419,9 +445,34 @@ function resolveTextValue(field, sampleData) {
   let value = raw;
   if (field.useValueMap) {
     const found = (field.valueMap || []).find((m) => m.value === raw);
-    value = found ? found.label : raw;
+    value = found ? pickMappedLabel(found, sampleData.gender, field.genderVariants) : raw;
   }
   return (field.customPrefix || "") + value;
+}
+
+const MM_TO_PT = 72 / 25.4;
+
+// Text width in points, measured with a canvas in the font the preview
+// draws with (see textLayout.js). Measuring at "size px" gives the width at
+// "size pt" in points, since width scales linearly with font size.
+let measureCanvas = null;
+function canvasTextMeasurer(font, letterSpacing) {
+  measureCanvas ||= document.createElement("canvas").getContext("2d");
+  return (text, size) => {
+    measureCanvas.font = `${font.weight} ${size}px ${font.family}`;
+    return measureCanvas.measureText(text).width + letterSpacing * Math.max([...text].length - 1, 0);
+  };
+}
+
+// The font's vertical metrics as the browser uses them, as fractions of
+// the font size: cap height (for centering by the letters, see
+// textLayout.js) and the ascent/descent CSS uses to place the baseline
+// inside a line box.
+function canvasFontMetrics(font) {
+  measureCanvas ||= document.createElement("canvas").getContext("2d");
+  measureCanvas.font = `${font.weight} 100px ${font.family}`;
+  const m = measureCanvas.measureText("H");
+  return { capHeight: m.actualBoundingBoxAscent / 100 || 0.72, ascent: m.fontBoundingBoxAscent / 100 || 0.9, descent: m.fontBoundingBoxDescent / 100 || 0.2 };
 }
 
 function anchorTransform(align) {
@@ -461,6 +512,7 @@ function textFieldDefaults() {
     template: "",
     useValueMap: false,
     valueMap: [],
+    genderVariants: false,
     font: "Helvetica",
     fontMode: "fixed",
     size: 10,
@@ -471,6 +523,17 @@ function textFieldDefaults() {
     w_mm: 60,
     breakStyle: "break-all",
     lineHeight: 1.05,
+    // "point": anchored at x/y, optional wrap/auto-fit (the original mode).
+    // "frame": a box the text is laid out in (see textLayout.js).
+    textKind: "point",
+    frame: { ...DEFAULT_FRAME },
+    textCase: "none",
+    // Per-value color, e.g. role "organizer" -> orange (see resolveTextColor).
+    colorMap: { enabled: false, source: "role", mappings: [] },
+    // Point text only: an optional box height (0 = none) the text is
+    // aligned in vertically, like a spreadsheet cell.
+    boxHeightMm: 0,
+    vAlign: "top",
   };
 }
 
@@ -492,6 +555,9 @@ function inflateTextField(f) {
     template: f.template || "",
     useValueMap: !!f.value_map,
     valueMap: f.value_map || [],
+    genderVariants: !!f.gender_variants,
+    boxHeightMm: f.box_height_mm || 0,
+    vAlign: f.v_align || "top",
     font: f.font || "Helvetica",
     color: f.color || "#141414",
     align: f.align || "left",
@@ -505,6 +571,10 @@ function inflateTextField(f) {
     size_min: f.size_min,
     size_max: f.size_max,
     max_width_mm: f.max_width_mm,
+    textKind: f.text_kind || "point",
+    frame: { ...DEFAULT_FRAME, ...(f.frame || {}) },
+    textCase: f.text_case || "none",
+    colorMap: f.color_map ? { enabled: true, source: f.color_map.source || "role", mappings: f.color_map.mappings || [] } : { enabled: false, source: "role", mappings: [] },
   };
 }
 function inflateImageField(f) {
@@ -523,6 +593,9 @@ function inflateImageField(f) {
     fallbackPath: f.fallbackPath || "assets/default.png",
     fallbackPreview: f.fallbackPreview || null,
     mappings: (f.mappings || []).map((m) => ({ value: m.value, path: m.path, preview: m.preview || null })),
+    // Part of the image to use and how it fills the box (see imageCrop.js).
+    crop: normalizeCrop(f.crop),
+    fit: f.fit || "contain",
   };
 }
 function inflateColorblockField(f) {
@@ -557,6 +630,8 @@ function inflateScheduleField(f) {
     dayIndex: f.dayIndex || 0,
     customTitle: f.customTitle || "",
     excludedIds: f.excludedIds || [],
+    // Column header texts; empty means the default ("Time" / "Event" / "Task").
+    columnLabels: { time: "", event: "", task: "", ...(f.columnLabels || {}) },
   };
 }
 function inflateTaskKeyField(f) {
@@ -582,6 +657,9 @@ function inflateField(f) {
 function inflateSide(s, fallbackW, fallbackH) {
   return {
     page: s?.page || { width_mm: fallbackW, height_mm: fallbackH },
+    // Safe area inset from every edge, in mm: only a design guide (snapping
+    // + warnings), never printed. 0 turns it off.
+    safeMarginMm: s?.safe_margin_mm ?? 3,
     background: s?.background_data || null,
     backgroundName: s?.background || "assets/background.png",
     tint: s?.background_tint
@@ -599,6 +677,11 @@ function inflateSide(s, fallbackW, fallbackH) {
     fields: (s?.fields || []).map(inflateField),
   };
 }
+// The global settings schedule.js's builders take (see buildBaseSchedule).
+function scheduleOptions(s) {
+  return { stageColors: s.stageColors, labels: s.scheduleLabels, mbldSubmission: s.mbldSubmission, mergedRounds: s.mergedRounds };
+}
+
 function inflateTemplate(data) {
   const inflatedFonts = Object.entries(data.fonts || {}).map(([family, meta]) => ({
     id: uid("font"),
@@ -617,7 +700,8 @@ function inflateTemplate(data) {
   uidCounter = Math.max(uidCounter, maxN + 1);
 
   return {
-    sampleData: data.sample_data || { name: "Sample Name" },
+    // gender: WCIF "m" / "f" / "o", for gender variants of mapped text.
+    sampleData: { ...(data.sample_data || { name: "Sample Name" }), gender: data.sample_data?.gender ?? "m" },
     scheduleTimezone: data.schedule_timezone || "",
     // A template saved before this feature existed won't have role_mapping
     // at all — default reproduces the old hardcoded organizer/delegate
@@ -629,6 +713,15 @@ function inflateTemplate(data) {
       ],
       fallback: "competitor",
     },
+    // Stage name -> color to print instead of the one set on the WCA
+    // website (see StageColorsPanel). Empty = WCA colors everywhere.
+    stageColors: data.stage_colors || {},
+    // User renames for schedule rows (see SchedulePanel / listScheduleTexts).
+    scheduleLabels: { events: {}, activities: {}, ...(data.schedule_labels || {}) },
+    // MBLD cube submission shown as a task (see buildCompetitorSchedules).
+    mbldSubmission: { enabled: false, task: "C", hideForOthers: false, ...(data.mbld_submission || {}) },
+    // Later rounds shown as one row instead of one per group (see buildBaseSchedule).
+    mergedRounds: data.merged_rounds || [],
     fonts: inflatedFonts,
     front: inflateSide(data.front, 105, 148),
     back: inflateSide(data.back, 148, 105),
@@ -642,6 +735,10 @@ export default function BadgeDesigner() {
   const [showData, setShowData] = useState(false);
   const [generating, setGenerating] = useState(null); // null | { done, total } | "error"
   const [guides, setGuides] = useState({ x: null, y: null });
+  // Ids of fields reaching past the safe margin, measured from what's
+  // actually drawn (so auto-width text, alignment and rotation all count).
+  const canvasRef = useRef(null);
+  const [outsideIds, setOutsideIds] = useState([]);
 
   // Inside BadgeDesigner component:
   const loadWcifData = async (compIdOrFile) => {
@@ -674,8 +771,8 @@ export default function BadgeDesigner() {
       // never a specific person's actual assignments. Real per-competitor
       // data (and buildCompetitorSchedules) only gets used later, in batch
       // generation, once this template is applied to the whole roster.
-      const genericSchedule = buildGenericSchedule(wcif, state.scheduleTimezone || undefined);
-      const stages = buildStageList(wcif);
+      const genericSchedule = buildGenericSchedule(wcif, state.scheduleTimezone || undefined, scheduleOptions(state));
+      const stages = buildStageList(wcif, state.stageColors);
 
       // Populates any "driven by country" image field's mappings from the
       // flags actually needed for this WCIF's competitors (see
@@ -686,6 +783,9 @@ export default function BadgeDesigner() {
       setState((prev) => ({
         ...prev,
         wcif, // full raw WCIF, kept so "Generate PDF" can use REAL per-competitor data later
+        // Every role and role combination present gets a rule (existing
+        // rules and their labels are kept), see addRolesFromPersons.
+        roleMapping: addRolesFromPersons(prev.roleMapping, badgeablePersons(wcif)),
         sampleData: {
           ...prev.sampleData,
           schedules: genericSchedule, // Map of "YYYY-MM-DD" -> placeholder row array
@@ -719,7 +819,34 @@ export default function BadgeDesigner() {
   const dragRef = useRef(null);
   const sideData = state[side];
   const fields = sideData.fields;
-  const selectedField = selectedId && selectedId !== TINT_ID && selectedId !== FONTS_ID && selectedId !== BGMAP_ID && selectedId !== ROLEMAP_ID ? fields.find((f) => f.id === selectedId) : null;
+
+  // Re-measured after every render (fields, fonts, sample data and page
+  // size all move things), on the next frame so the layout is settled; the
+  // functional update keeps the same array when nothing changed, so it
+  // doesn't trigger another render.
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const m = (sideData.safeMarginMm || 0) * SCALE;
+      const page = canvas.getBoundingClientRect();
+      const safe = { left: page.left + m, top: page.top + m, right: page.right - m, bottom: page.bottom - m };
+      const TOL = 0.5; // px, so a field snapped exactly onto the line doesn't count
+      const next = [];
+      if (m > 0) {
+        for (const el of canvas.querySelectorAll("[data-field-id]")) {
+          // A non-wrapping text box is auto-width and its text is shifted by
+          // its alignment, so measure the text itself rather than the box.
+          const target = el.dataset.fieldType === "text" ? el.querySelector("[data-text-content]") || el : el;
+          const r = target.getBoundingClientRect();
+          if (r.left < safe.left - TOL || r.top < safe.top - TOL || r.right > safe.right + TOL || r.bottom > safe.bottom + TOL) next.push(el.dataset.fieldId);
+        }
+      }
+      setOutsideIds((prev) => (prev.join() === next.join() ? prev : next));
+    });
+    return () => cancelAnimationFrame(frame);
+  });
+  const selectedField = selectedId && selectedId !== TINT_ID && selectedId !== FONTS_ID && selectedId !== BGMAP_ID && selectedId !== ROLEMAP_ID && selectedId !== STAGECOLORS_ID && selectedId !== SCHEDULE_ID ? fields.find((f) => f.id === selectedId) : null;
 
   const updateSide = (patch) => setState((s) => ({ ...s, [side]: { ...s[side], ...patch } }));
   const updateField = (id, patch) => updateSide({ fields: sideData.fields.map((f) => (f.id === id ? { ...f, ...patch } : f)) });
@@ -741,6 +868,25 @@ export default function BadgeDesigner() {
   // Global, not per-side (like scheduleTimezone) — a person's role doesn't
   // change between the front and back of their own badge.
   const updateRoleMapping = (patch) => setState((s) => ({ ...s, roleMapping: { ...s.roleMapping, ...patch } }));
+  // Global too: a stage is the same color on every badge and on both sides.
+  // color === null drops the override, going back to the WCA color.
+  // sampleData.stages and .schedules are re-derived so the Task Key and
+  // schedule previews follow along.
+  const setStageColor = (name, color) =>
+    setState((prev) => {
+      const stageColors = { ...prev.stageColors };
+      if (color) stageColors[name] = color;
+      else delete stageColors[name];
+      if (prev.wcif) {
+        const schedules = buildGenericSchedule(prev.wcif, prev.scheduleTimezone || undefined, scheduleOptions({ ...prev, stageColors }));
+        return { ...prev, stageColors, sampleData: { ...prev.sampleData, stages: buildStageList(prev.wcif, stageColors), schedules } };
+      }
+      const stages = (prev.sampleData.stages || []).map((s) => {
+        const wcaColor = s.wcaColor || s.color;
+        return { ...s, wcaColor, color: stageColors[s.name] || wcaColor };
+      });
+      return { ...prev, stageColors, sampleData: { ...prev.sampleData, stages } };
+    });
 
   const addField = (type) => {
     const count = fields.filter((f) => f.type === type).length;
@@ -752,7 +898,7 @@ export default function BadgeDesigner() {
     if (type === "colorblock")
       Object.assign(base, { w_mm: 30, h_mm: 10, mapSource: "role", fallbackColor: "#9CA3AF", opacity: 100, mappings: [{ value: "competitor", color: "#1E5FD9" }], labelSource: "role", labelColor: "#FFFFFF" });
     if (type === "qr") Object.assign(base, { size_mm: 16, target: "https://example.org/{wcaId}" });
-    if (type === "schedule") Object.assign(base, { w_mm: 60, h_mm: 40, dayIndex: 0, customTitle: "", excludedIds: [] });
+    if (type === "schedule") Object.assign(base, { w_mm: 60, h_mm: 40, dayIndex: 0, customTitle: "", excludedIds: [], columnLabels: { time: "", event: "", task: "" } });
     if (type === "taskkey") Object.assign(base, { w_mm: 70, stageNames: [] });
     updateSide({ fields: [...fields, base] });
     setSelectedId(base.id);
@@ -811,12 +957,32 @@ export default function BadgeDesigner() {
       if (prev.wcif) {
         next.sampleData = {
           ...prev.sampleData,
-          schedules: buildGenericSchedule(prev.wcif, tz || undefined),
+          schedules: buildGenericSchedule(prev.wcif, tz || undefined, scheduleOptions(prev)),
         };
       }
       return next;
     });
   };
+  // Global like the timezone: renames and the MBLD submission task apply to
+  // every schedule field. Same re-derivation as above, for the live preview.
+  const updateScheduleSettings = (patch) =>
+    setState((prev) => {
+      const next = { ...prev, ...patch };
+      if (prev.wcif) {
+        next.sampleData = { ...prev.sampleData, schedules: buildGenericSchedule(prev.wcif, prev.scheduleTimezone || undefined, scheduleOptions(next)) };
+      }
+      return next;
+    });
+  // kind: "events" (keyed by event id) or "activities" (keyed by the
+  // activity's WCIF name). Empty text drops the rename.
+  const setScheduleLabel = (kind, key, text) => {
+    const group = { ...(state.scheduleLabels[kind] || {}) };
+    if (text) group[key] = text;
+    else delete group[key];
+    updateScheduleSettings({ scheduleLabels: { ...state.scheduleLabels, [kind]: group } });
+  };
+  const updateMbldSubmission = (patch) => updateScheduleSettings({ mbldSubmission: { ...state.mbldSubmission, ...patch } });
+  const scheduleTexts = state.wcif ? listScheduleTexts(state.wcif) : null;
   const detectedScheduleTimezone = state.wcif ? resolveScheduleTimezone(state.wcif) : null;
 
   const round1 = (v) => Math.round(v * 10) / 10;
@@ -855,36 +1021,43 @@ export default function BadgeDesigner() {
       const h = d.origH;
       const others = sd.fields.filter((f) => f.id !== d.id);
 
+      // [position to snap to, where to draw the guide line]: alignment
+      // snaps show the field's center line, safe-margin snaps the margin.
+      const m = sd.safeMarginMm || 0;
+      const marginX = m > 0 ? [[m, m], [pw - m - w, pw - m]] : [];
+      const marginY = m > 0 ? [[m, m], [ph - m - h, ph - m]] : [];
       const candX = [
-        (pw - w) / 2,
+        ...marginX,
+        [(pw - w) / 2, pw / 2],
         ...others.flatMap((f) => {
           const fw = fieldBoxWidthMm(f); // 0 for a non-wrap text field, its real box width when wrapped
-          return [f.x_mm, f.x_mm + fw - w, f.x_mm + fw / 2 - w / 2];
+          return [f.x_mm, f.x_mm + fw - w, f.x_mm + fw / 2 - w / 2].map((c) => [c, c + w / 2]);
         }),
       ];
       const candY = [
-        (ph - h) / 2,
+        ...marginY,
+        [(ph - h) / 2, ph / 2],
         ...others.flatMap((f) => {
           const fh = fieldBoxHeightMm(f);
-          return [f.y_mm, f.y_mm + fh - h, f.y_mm + fh / 2 - h / 2];
+          return [f.y_mm, f.y_mm + fh - h, f.y_mm + fh / 2 - h / 2].map((c) => [c, c + h / 2]);
         }),
       ];
 
       let nx = rawX;
       let gx = null;
-      for (const c of candX) {
+      for (const [c, guide] of candX) {
         if (Math.abs(rawX - c) <= SNAP_TOL) {
           nx = c;
-          gx = c + w / 2;
+          gx = guide;
           break;
         }
       }
       let ny = rawY;
       let gy = null;
-      for (const c of candY) {
+      for (const [c, guide] of candY) {
         if (Math.abs(rawY - c) <= SNAP_TOL) {
           ny = c;
-          gy = c + h / 2;
+          gy = guide;
           break;
         }
       }
@@ -893,7 +1066,11 @@ export default function BadgeDesigner() {
       applyFieldPatch(d.id, { x_mm: round1(nx), y_mm: round1(ny) });
     } else {
       const nw = clamp(d.origW + dx, MIN_MM, pw - d.origX);
-      if (d.type === "schedule" || d.type === "taskkey") {
+      const dragged = sd.fields.find((f) => f.id === d.id);
+      if (dragged?.type === "text" && dragged.textKind === "frame") {
+        const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
+        applyFieldPatch(d.id, { frame: { ...dragged.frame, w_mm: round1(nw), ...(dragged.frame.auto_height ? {} : { h_mm: round1(nh) }) } });
+      } else if (d.type === "schedule" || d.type === "taskkey") {
         // Height is derived, not draggable — width only.
         applyFieldPatch(d.id, { w_mm: round1(nw) });
       } else if (d.type === "qr") {
@@ -906,6 +1083,10 @@ export default function BadgeDesigner() {
         const newSize = Math.abs(nw - d.origW) >= Math.abs(nh - d.origH) ? nw : nh;
         const maxSize = Math.min(pw - d.origX, ph - d.origY);
         applyFieldPatch(d.id, { size_mm: round1(clamp(newSize, MIN_MM, maxSize)) });
+      } else if (dragged?.type === "text") {
+        // Wrapped point text: width, plus the box height when it has one.
+        const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
+        applyFieldPatch(d.id, { w_mm: round1(nw), ...(dragged.boxHeightMm > 0 ? { boxHeightMm: round1(nh) } : {}) });
       } else {
         const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
         applyFieldPatch(d.id, { w_mm: round1(nw), h_mm: round1(nh) });
@@ -1009,14 +1190,21 @@ export default function BadgeDesigner() {
             out.template = f.template;
           } else {
             out.source = f.source;
-            if (f.useValueMap) Object.assign(out, { value_map: f.valueMap });
+            if (f.useValueMap) Object.assign(out, { value_map: f.valueMap, ...(f.genderVariants ? { gender_variants: true } : {}) });
           }
           Object.assign(out, { font: f.font, color: f.color, align: f.align || "left", letter_spacing: f.letterSpacing || 0, wrap: !!f.wrap });
           if (f.wrap) Object.assign(out, { w_mm: f.w_mm, break_style: f.breakStyle, line_height: f.lineHeight || 1.05 });
-          if (f.fontMode === "autofit") Object.assign(out, { size_min: f.size_min, size_max: f.size_max, max_width_mm: f.max_width_mm || 60 });
+          if (f.textCase && f.textCase !== "none") out.text_case = f.textCase;
+          if (f.colorMap?.enabled) out.color_map = { source: f.colorMap.source, mappings: f.colorMap.mappings };
+          if (f.textKind === "frame") {
+            Object.assign(out, { text_kind: "frame", frame: f.frame, size: f.size, line_height: f.lineHeight || 1.05, break_style: f.breakStyle });
+          } else if (f.fontMode === "autofit") Object.assign(out, { size_min: f.size_min, size_max: f.size_max, max_width_mm: f.max_width_mm || 60 });
           else out.size = f.size;
+          if (f.textKind !== "frame" && f.boxHeightMm > 0) Object.assign(out, { box_height_mm: f.boxHeightMm, v_align: f.vAlign || "top" });
         } else if (f.type === "image") {
           Object.assign(out, { w_mm: f.w_mm, h_mm: f.h_mm, mapped: f.mapped });
+          if (!isFullCrop(f.crop)) out.crop = f.crop;
+          if (f.fit && f.fit !== "contain") out.fit = f.fit;
           if (f.mapped) {
             Object.assign(out, {
               mapSource: f.mapSource,
@@ -1033,7 +1221,7 @@ export default function BadgeDesigner() {
         } else if (f.type === "qr") {
           Object.assign(out, { target: f.target, size_mm: f.size_mm });
         } else if (f.type === "schedule") {
-          Object.assign(out, { w_mm: f.w_mm, h_mm: f.h_mm, dayIndex: f.dayIndex || 0, customTitle: f.customTitle || "", excludedIds: f.excludedIds || [] });
+          Object.assign(out, { w_mm: f.w_mm, h_mm: f.h_mm, dayIndex: f.dayIndex || 0, customTitle: f.customTitle || "", excludedIds: f.excludedIds || [], columnLabels: f.columnLabels });
         } else if (f.type === "taskkey") {
           Object.assign(out, { w_mm: f.w_mm, stageNames: f.stageNames || [] });
         }
@@ -1057,9 +1245,14 @@ export default function BadgeDesigner() {
       sample_data: state.sampleData,
       schedule_timezone: state.scheduleTimezone || "",
       role_mapping: state.roleMapping,
+      stage_colors: state.stageColors,
+      schedule_labels: state.scheduleLabels,
+      mbld_submission: state.mbldSubmission,
+      merged_rounds: state.mergedRounds,
       fonts: fontsManifest,
       front: {
         page: state.front.page,
+        safe_margin_mm: state.front.safeMarginMm,
         background: state.front.backgroundName,
         background_data: state.front.background || null,
         background_tint: cleanTint(state.front.tint),
@@ -1068,6 +1261,7 @@ export default function BadgeDesigner() {
       },
       back: {
         page: state.back.page,
+        safe_margin_mm: state.back.safeMarginMm,
         background: state.back.backgroundName,
         background_data: state.back.background || null,
         background_tint: cleanTint(state.back.tint),
@@ -1187,6 +1381,12 @@ export default function BadgeDesigner() {
           <span>mm</span>
         </div>
 
+        <label className="flex items-center gap-1.5 text-xs text-neutral-500" title="Safe margin: a guide drawn this far inside every edge while designing. Not printed.">
+          <span>Margin</span>
+          <input type="number" min={0} step={0.5} value={sideData.safeMarginMm} onChange={(e) => updateSide({ safeMarginMm: clamp(Number(e.target.value) || 0, 0, Math.min(sideData.page.width_mm, sideData.page.height_mm) / 2) })} className="w-12 px-1.5 py-1 border border-neutral-300 rounded text-neutral-800" />
+          <span>mm</span>
+        </label>
+
         <label className="flex items-center gap-1.5 text-sm px-3 py-1.5 border border-neutral-300 rounded-md cursor-pointer hover:bg-neutral-50">
           <Upload size={14} />
           Background
@@ -1211,6 +1411,14 @@ export default function BadgeDesigner() {
 
         <button onClick={() => setSelectedId(ROLEMAP_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === ROLEMAP_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
           <Users size={12} /> Role mapping
+        </button>
+
+        <button onClick={() => setSelectedId(STAGECOLORS_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === STAGECOLORS_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
+          <SwatchBook size={12} /> Stage colors
+        </button>
+
+        <button onClick={() => setSelectedId(SCHEDULE_ID)} className={`flex items-center gap-1 text-xs px-2 py-1.5 border rounded-md ${selectedId === SCHEDULE_ID ? "border-blue-400 text-blue-700 bg-blue-50" : "border-neutral-300 hover:bg-neutral-50"}`}>
+          <Rows3 size={12} /> Schedule
         </button>
 
         <div className="flex-1" />
@@ -1268,7 +1476,7 @@ export default function BadgeDesigner() {
 
       <div className="flex flex-1 overflow-hidden">
         <div className="flex-1 flex items-center justify-center p-8 overflow-auto">
-          <div onPointerDown={() => setSelectedId(null)} style={{ width: pw, height: ph, backgroundColor: "#ffffff", position: "relative" }} className="shadow-lg border border-neutral-300 rounded-sm overflow-hidden">
+          <div ref={canvasRef} onPointerDown={() => setSelectedId(null)} style={{ width: pw, height: ph, backgroundColor: "#ffffff", position: "relative" }} className="shadow-lg border border-neutral-300 rounded-sm overflow-hidden">
             {bgMapEnabled ? (
               bgMapSrc && <img src={bgMapSrc} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }} />
             ) : (
@@ -1280,8 +1488,18 @@ export default function BadgeDesigner() {
               )
             )}
             {fields.map((f) => (
-              <FieldBox key={f.id} field={f} scale={SCALE} selected={selectedId === f.id} sampleData={state.sampleData} onPointerDownMove={(e) => startDrag(e, f, "move")} onPointerDownResize={(e) => startDrag(e, f, "resize")} />
+              <FieldBox key={f.id} field={f} scale={SCALE} selected={selectedId === f.id} outsideMargin={outsideIds.includes(f.id)} sampleData={state.sampleData} onPointerDownMove={(e) => startDrag(e, f, "move")} onPointerDownResize={(e) => startDrag(e, f, "resize")} />
             ))}
+            {sideData.safeMarginMm > 0 && (
+              <div
+                style={{
+                  position: "absolute",
+                  inset: sideData.safeMarginMm * SCALE,
+                  border: "1px dashed rgba(236, 72, 153, 0.8)",
+                  pointerEvents: "none",
+                }}
+              />
+            )}
             {guides.x !== null && (
               <div style={{ position: "absolute", left: guides.x * SCALE, top: 0, bottom: 0, width: 1, background: "#2563eb", pointerEvents: "none" }} />
             )}
@@ -1352,6 +1570,11 @@ export default function BadgeDesigner() {
                       <GripVertical size={13} className="text-neutral-300 cursor-grab shrink-0" />
                       <Icon size={14} className="shrink-0" />
                       <span className="flex-1 truncate">{fieldLabel}</span>
+                      {outsideIds.includes(f.id) && (
+                        <span title="Goes past the safe margin — it may get cut off when printing" className="text-amber-500 shrink-0">
+                          <TriangleAlert size={13} />
+                        </span>
+                      )}
                       <div className="flex flex-col shrink-0">
                         <button
                           onClick={(e) => {
@@ -1404,7 +1627,19 @@ export default function BadgeDesigner() {
                 addingGoogleFont={addingGoogleFont}
               />
             )}
-            {selectedId === ROLEMAP_ID && <RoleMappingPanel roleMapping={state.roleMapping} onChange={updateRoleMapping} />}
+            {selectedId === ROLEMAP_ID && <RoleMappingPanel roleMapping={state.roleMapping} onChange={updateRoleMapping} persons={state.wcif ? badgeablePersons(state.wcif) : null} />}
+            {selectedId === SCHEDULE_ID && (
+              <SchedulePanel
+                texts={scheduleTexts}
+                labels={state.scheduleLabels}
+                onLabelChange={setScheduleLabel}
+                mbldSubmission={state.mbldSubmission}
+                onMbldChange={updateMbldSubmission}
+                mergedRounds={state.mergedRounds}
+                onMergedRoundsChange={(codes) => updateScheduleSettings({ mergedRounds: codes })}
+              />
+            )}
+            {selectedId === STAGECOLORS_ID && <StageColorsPanel stages={state.sampleData.stages || []} stageColors={state.stageColors} onChange={setStageColor} />}
             {selectedField && (
               <PropertiesPanel
                 field={selectedField}
@@ -1428,7 +1663,7 @@ export default function BadgeDesigner() {
   );
 }
 
-function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPointerDownResize }) {
+function FieldBox({ field, scale, selected, outsideMargin, sampleData, onPointerDownMove, onPointerDownResize }) {
   const w = fieldBoxWidthMm(field) * scale;
   const textWraps = field.type === "text" && field.wrap;
   const align = field.align || "left";
@@ -1457,49 +1692,124 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
     taskKeyHeightPx = TASKKEY_HEADER_HEIGHT_PX + rowCount * TASKKEY_ROW_HEIGHT_PX;
   }
 
-  const h = field.type === "schedule" ? scheduleHeightPx : field.type === "taskkey" ? taskKeyHeightPx : fieldBoxHeightMm(field) * scale;
+  // Text: points -> preview px (1 pt = 25.4/72 mm, at `scale` px per mm),
+  // measured with the same font the preview draws in, so a text frame
+  // breaks lines exactly where textLayout.js will in the PDF.
+  const ptPx = (scale * 25.4) / 72;
+  const isTextFrame = field.type === "text" && field.textKind === "frame";
+  let textFont = null;
+  let textValue = null;
+  let textColor = null;
+  let measureText = null;
+  let frameLayout = null;
+  let fontMetrics = null;
+  if (field.type === "text") {
+    const isCustom = !BUILTIN_FONTS.includes(field.font);
+    textFont = { family: isCustom ? `"${field.font}", sans-serif` : "Helvetica, Arial, sans-serif", weight: field.font === "Helvetica-Bold" ? 700 : 400 };
+    textValue = applyTextCase(resolveTextValue(field, sampleData), field.textCase);
+    textColor = resolveTextColor(field, sampleData);
+    measureText = canvasTextMeasurer(textFont, field.letterSpacing || 0);
+    if (isTextFrame) {
+      fontMetrics = canvasFontMetrics(textFont);
+      frameLayout = layoutTextFrame(textValue, field.frame, { measure: measureText, lineHeight: field.lineHeight || 1.05, breakStyle: field.breakStyle || "break-word", fixedSize: field.size || 12, capHeight: fontMetrics.capHeight });
+    }
+  }
+
+  let h = field.type === "schedule" ? scheduleHeightPx : field.type === "taskkey" ? taskKeyHeightPx : fieldBoxHeightMm(field) * scale;
+  if (isTextFrame && field.frame.auto_height) h = (frameLayout.blockHeight + 2 * frameLayout.padding) * ptPx;
+  const pointBox = field.type === "text" && !isTextFrame && field.boxHeightMm > 0;
 
   const style = {
     position: "absolute",
     left: field.x_mm * scale,
     top: field.y_mm * scale,
-    width: field.type === "text" ? (textWraps ? w : "auto") : w,
-    height: field.type === "text" ? "auto" : h,
-    outline: selected ? "1.5px solid #2563eb" : "1px dashed rgba(0,0,0,0.25)",
+    width: field.type === "text" && !isTextFrame ? (textWraps ? w : "auto") : w,
+    height: field.type === "text" && !isTextFrame ? (pointBox ? field.boxHeightMm * scale : "auto") : h,
+    outline: selected ? "1.5px solid #2563eb" : outsideMargin ? "1.5px dashed #f59e0b" : "1px dashed rgba(0,0,0,0.25)",
     cursor: "move",
     userSelect: "none",
-    transform: field.rotate ? `rotate(-${field.rotate}deg)` : undefined,
+    // Unwrapped point text is anchored at X by its alignment (left edge /
+    // center / right edge), so the whole box shifts — not just the text —
+    // and its outline (and box height) stays around the text. Translate is
+    // listed last so it applies before the rotation, which keeps pivoting
+    // on the X/Y anchor like the PDF does.
+    transform: [field.rotate ? `rotate(-${field.rotate}deg)` : null, field.type === "text" && !isTextFrame && !textWraps ? anchorTransform(align) : null].filter(Boolean).join(" ") || undefined,
     transformOrigin: "top left",
   };
 
   let content;
-  if (field.type === "text") {
-    const isBuiltinBold = field.font === "Helvetica-Bold";
-    const isCustom = !BUILTIN_FONTS.includes(field.font);
-    const fontFamily = isCustom ? `"${field.font}", sans-serif` : "Helvetica, Arial, sans-serif";
-    const fontWeight = isBuiltinBold ? 700 : 400;
-    const fontSize = field.fontMode === "autofit" ? field.size_max : field.size;
-    const value = resolveTextValue(field, sampleData);
+  if (field.type === "text" && isTextFrame) {
+    const { lines, size, lineHeight, baselines, padding, innerW, overflow } = frameLayout;
+    // Each line box is placed so its baseline (where CSS puts it: half the
+    // leading plus the font's ascent) lands on the layout's baseline.
+    const baselineInLine = ((lineHeight - (fontMetrics.ascent + fontMetrics.descent) * size) / 2 + fontMetrics.ascent * size) * ptPx;
     content = (
+      <>
+        {lines.map((line, i) => (
+          <div
+            key={i}
+            style={{
+              position: "absolute",
+              left: padding * ptPx,
+              top: (padding + baselines[i]) * ptPx - baselineInLine,
+              width: innerW * ptPx,
+              height: lineHeight * ptPx,
+              fontSize: size * ptPx,
+              lineHeight: `${lineHeight * ptPx}px`,
+              fontWeight: textFont.weight,
+              fontFamily: textFont.family,
+              color: textColor,
+              letterSpacing: `${(field.letterSpacing || 0) * ptPx}px`,
+              whiteSpace: "pre",
+              textAlign: align,
+            }}
+          >
+            {line}
+          </div>
+        ))}
+        {overflow && (
+          // Like Affinity's overflow marker: the text doesn't fit the frame
+          // even at its smallest size. Editor-only, never printed.
+          <div title="Text doesn't fit this frame" style={{ position: "absolute", right: -5, bottom: -5, width: 10, height: 10, background: "#dc2626", border: "1.5px solid #fff", borderRadius: 2 }} />
+        )}
+      </>
+    );
+  } else if (field.type === "text") {
+    const fontSize =
+      field.fontMode === "autofit"
+        ? shrinkToWidth(textValue, { min: field.size_min || 8, max: field.size_max || 16, maxWidth: (field.max_width_mm || 60) * MM_TO_PT, measure: measureText })
+        : field.size;
+    const text = (
       <div
+        data-text-content
         style={{
-          fontSize: fontSize * (scale / 2.6),
-          fontWeight,
-          fontFamily,
-          color: field.color,
+          fontSize: fontSize * ptPx,
+          fontWeight: textFont.weight,
+          fontFamily: textFont.family,
+          color: textColor,
           lineHeight: field.lineHeight || 1.05,
-          letterSpacing: `${(field.letterSpacing || 0) * (scale / 2.6)}px`,
-          whiteSpace: textWraps ? "pre-wrap" : "pre-line",
+          letterSpacing: `${(field.letterSpacing || 0) * ptPx}px`,
+          // Without wrap, only explicit line breaks break lines — as in the
+          // PDF. ("pre-line" also wrapped long text at the page edge.)
+          whiteSpace: textWraps ? "pre-wrap" : "pre",
           wordBreak: textWraps ? field.breakStyle || "break-word" : undefined,
           overflowWrap: textWraps ? "anywhere" : undefined,
           width: textWraps ? "100%" : undefined,
           textAlign: align,
-          transform: textWraps ? undefined : anchorTransform(align),
           display: textWraps ? undefined : "inline-block",
         }}
       >
-        {value}
+        {textValue}
       </div>
+    );
+    // In a box (see drawTextField in pdfExport.js): the text block at its
+    // top, middle or bottom, by flex alignment of the block's own height.
+    content = pointBox ? (
+      <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "flex-start", justifyContent: { middle: "center", bottom: "flex-end" }[field.vAlign] || "flex-start" }}>
+        {text}
+      </div>
+    ) : (
+      text
     );
   } else if (field.type === "image") {
     let src = field.preview;
@@ -1509,7 +1819,7 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
       src = m ? m.preview : field.fallbackPreview;
       label = m ? m.path?.split("/").pop() : field.fallbackPath?.split("/").pop() || "no match";
     }
-    content = src ? <img src={src} alt="" className="w-full h-full object-contain" /> : <div className="w-full h-full flex items-center justify-center bg-neutral-200/70 text-[9px] text-neutral-500 rounded text-center px-1">{label}</div>;
+    content = src ? <CroppedImage src={src} crop={field.crop} fit={field.fit || "contain"} boxW={w} boxH={h} /> : <div className="w-full h-full flex items-center justify-center bg-neutral-200/70 text-[9px] text-neutral-500 rounded text-center px-1">{label}</div>;
   } else if (field.type === "colorblock") {
     const color = resolveMapping(field, sampleData, "color");
     const label = field.labelSource ? sampleData[field.labelSource] : null;
@@ -1552,9 +1862,9 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
             className="flex font-semibold shrink-0 text-center items-center"
             style={{ height: SCHEDULE_SUBHEADER_HEIGHT_PX, boxSizing: "border-box", background: SCHEDULE_COLORS.subheaderBg, borderBottom: `1px solid ${SCHEDULE_COLORS.border}` }}
           >
-            <span className="w-10 h-full flex items-center justify-center shrink-0" style={{ borderRight: `1px solid ${SCHEDULE_COLORS.border}` }}>Time</span>
-            <span className="flex-1 h-full flex items-center justify-center" style={{ borderRight: `1px solid ${SCHEDULE_COLORS.border}` }}>Event</span>
-            <span className="w-9 h-full flex items-center justify-center shrink-0">Task</span>
+            <span className="w-10 h-full flex items-center justify-center shrink-0" style={{ borderRight: `1px solid ${SCHEDULE_COLORS.border}` }}>{field.columnLabels?.time || "Time"}</span>
+            <span className="flex-1 h-full flex items-center justify-center" style={{ borderRight: `1px solid ${SCHEDULE_COLORS.border}` }}>{field.columnLabels?.event || "Event"}</span>
+            <span className="w-9 h-full flex items-center justify-center shrink-0">{field.columnLabels?.task || "Task"}</span>
           </div>
 
           {/* Rows — grouped into "blocks": a normal row stays a single row,
@@ -1622,8 +1932,8 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
                 }
 
                 const r = block.row;
-                const isSpecial = r.isSpecial || /lunch|dinner|opening|awards|tutorial/i.test(r.event);
-                const specialBg = /lunch|dinner/i.test(r.event) ? SCHEDULE_COLORS.lunchBg : SCHEDULE_COLORS.otherSpecialBg;
+                const isSpecial = isSpecialScheduleRow(r);
+                const specialBg = /lunch|dinner/i.test(r.activityCode || r.event) ? SCHEDULE_COLORS.lunchBg : SCHEDULE_COLORS.otherSpecialBg;
 
                 return (
                   <div
@@ -1736,12 +2046,12 @@ function FieldBox({ field, scale, selected, sampleData, onPointerDownMove, onPoi
   }
 
   return (
-    <div style={style} onPointerDown={onPointerDownMove}>
+    <div style={style} data-field-id={field.id} data-field-type={isTextFrame ? "textframe" : field.type} onPointerDown={onPointerDownMove}>
       {content}
-      {selected && (field.type !== "text" || textWraps) && (
+      {selected && (field.type !== "text" || textWraps || isTextFrame) && (
         <div
           onPointerDown={onPointerDownResize}
-          style={{ position: "absolute", right: -4, bottom: -4, width: 10, height: 10, background: "#2563eb", borderRadius: 2, cursor: field.type === "schedule" || field.type === "taskkey" ? "ew-resize" : "nwse-resize" }}
+          style={{ position: "absolute", right: -4, bottom: -4, width: 10, height: 10, background: "#2563eb", borderRadius: 2, cursor: field.type === "schedule" || field.type === "taskkey" || (isTextFrame && field.frame.auto_height) ? "ew-resize" : "nwse-resize" }}
         />
       )}
     </div>
@@ -1939,8 +2249,11 @@ function BackgroundMapPanel({ bgMap, sampleData, onChange }) {
   );
 }
 
-function RoleMappingPanel({ roleMapping, onChange }) {
+function RoleMappingPanel({ roleMapping, onChange, persons }) {
   const rules = roleMapping.rules || [];
+  // With a WCIF loaded: how many people each rule catches (first match wins).
+  const tally = persons ? countByRule(roleMapping, persons) : null;
+  const people = (n) => `${n} ${n === 1 ? "person" : "people"}`;
 
   const updateRule = (i, patch) => onChange({ rules: rules.map((r, idx) => (idx === i ? { ...r, ...patch } : r)) });
   const addRule = () => onChange({ rules: [...rules, { wcaRole: "", label: "" }] });
@@ -1959,7 +2272,7 @@ function RoleMappingPanel({ roleMapping, onChange }) {
         <Users size={12} /> ROLE MAPPING
       </div>
       <div className="text-[11px] text-neutral-400">
-        Maps a competitor's WCIF role(s) to the "role" value used throughout the template (text, tint, background images, etc). Checked top to bottom — the first matching rule wins, since a person can hold more than one role at once (e.g. an organizer who's also judging). Anyone matching nothing below gets the fallback.
+        Maps a competitor's WCIF role(s) to the "role" value used throughout the template (text, tint, background images, etc). Checked top to bottom — the first matching rule wins, since a person can hold more than one role at once (e.g. an organizer who's also judging). Anyone matching nothing below gets the fallback. Join roles with "+" (e.g. delegate+organizer) for people who have all of them — keep those above the single roles. Loading a WCIF adds every role and combination it contains.
       </div>
 
       <div className="space-y-1.5">
@@ -1986,6 +2299,11 @@ function RoleMappingPanel({ roleMapping, onChange }) {
               placeholder="role value, e.g. judge"
               className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0"
             />
+            {tally && (
+              <span className={`text-[10px] w-6 text-right shrink-0 ${tally.counts[i] ? "text-neutral-500" : "text-neutral-300"}`} title={people(tally.counts[i])}>
+                {tally.counts[i]}
+              </span>
+            )}
             <button onClick={() => removeRule(i)} className="text-neutral-400 hover:text-red-500 shrink-0">
               <Trash2 size={12} />
             </button>
@@ -1998,7 +2316,7 @@ function RoleMappingPanel({ roleMapping, onChange }) {
       </button>
 
       <div>
-        <div className="text-[11px] text-neutral-500 mb-1">Fallback (no rule matched)</div>
+        <div className="text-[11px] text-neutral-500 mb-1">Fallback (no rule matched){tally ? ` — ${people(tally.fallback)}` : ""}</div>
         <input
           value={roleMapping.fallback || ""}
           onChange={(e) => onChange({ fallback: e.target.value })}
@@ -2009,6 +2327,152 @@ function RoleMappingPanel({ roleMapping, onChange }) {
 
       <div className="text-[10px] text-neutral-400">
         WCA role strings per the WCIF spec include: delegate, trainee-delegate, organizer, staff-judge, staff-scrambler, staff-runner, staff-dataentry, staff-announcer.
+      </div>
+    </div>
+  );
+}
+
+// Global schedule settings: renames for the texts the WCIF produces, and the
+// MBLD cube submission task. Per-table settings (day, title, column
+// headers, hidden activities) stay on each schedule field.
+function SchedulePanel({ texts, labels, onLabelChange, mbldSubmission, onMbldChange, mergedRounds, onMergedRoundsChange }) {
+  const merged = new Set(mergedRounds);
+  const toggleRound = (code) => {
+    const next = new Set(merged);
+    if (next.has(code)) next.delete(code);
+    else next.add(code);
+    onMergedRoundsChange([...next]);
+  };
+  // Only rounds actually split into groups are worth offering.
+  const mergeable = (texts?.laterRounds || []).filter((r) => r.groups > 1);
+
+  const renameRow = (kind, key, defaultText) => (
+    <div key={key} className="flex items-center gap-1.5">
+      <span className="w-28 text-[11px] text-neutral-500 truncate shrink-0" title={kind === "activities" ? key : defaultText}>
+        {defaultText}
+      </span>
+      <span className="text-neutral-300 text-xs">→</span>
+      <input
+        type="text"
+        value={labels[kind]?.[key] || ""}
+        placeholder={defaultText}
+        onChange={(e) => onLabelChange(kind, key, e.target.value)}
+        className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0"
+      />
+    </div>
+  );
+
+  return (
+    <div className="p-4 space-y-4 border-t border-neutral-200 overflow-y-auto">
+      <div className="text-xs font-semibold text-neutral-500 flex items-center gap-1.5">
+        <Rows3 size={12} /> SCHEDULE
+      </div>
+
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between">
+          <div className="text-[11px] font-semibold text-neutral-600">One row per round</div>
+          {mergeable.length > 0 && (
+            <div className="flex gap-2 text-[11px]">
+              <button onClick={() => onMergedRoundsChange(mergeable.map((r) => r.code))} className="text-blue-600 hover:underline">All</button>
+              <button onClick={() => onMergedRoundsChange([])} className="text-blue-600 hover:underline">None</button>
+            </div>
+          )}
+        </div>
+        <div className="text-[10px] text-neutral-400">
+          Tick a round to show all its groups as a single row, starting at its first group (e.g. 8 rows of "3x3x3 Final" become one). Only later rounds are listed — in round 1 each person has a different task in each group.
+        </div>
+        {mergeable.map((r) => (
+          <label key={r.code} className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={merged.has(r.code)} onChange={() => toggleRound(r.code)} />
+            <span className="flex-1">{r.label}</span>
+            <span className="text-[10px] text-neutral-400">{r.groups} groups</span>
+          </label>
+        ))}
+        {texts && mergeable.length === 0 && <div className="text-xs text-neutral-400">No later round in this competition has more than one group.</div>}
+        {!texts && <div className="text-xs text-neutral-400">Load a WCIF to choose rounds.</div>}
+      </div>
+
+      <div className="space-y-2 border-t border-neutral-200 pt-3">
+        <div className="text-[11px] font-semibold text-neutral-600">MBLD cube submission</div>
+        <label className="flex items-center gap-2 text-xs">
+          <input type="checkbox" checked={!!mbldSubmission.enabled} onChange={(e) => onMbldChange({ enabled: e.target.checked })} />
+          Show it as a task
+        </label>
+        {mbldSubmission.enabled && (
+          <>
+            <label className="flex items-center gap-2 text-xs">
+              <span className="text-neutral-500">Task for MBLD competitors</span>
+              <input
+                type="text"
+                value={mbldSubmission.task || ""}
+                placeholder="C"
+                maxLength={3}
+                onChange={(e) => onMbldChange({ task: e.target.value })}
+                className="w-14 text-xs px-2 py-1 border border-neutral-300 rounded-md text-center font-bold"
+              />
+            </label>
+            <label className="flex items-center gap-2 text-xs">
+              <input type="checkbox" checked={!!mbldSubmission.hideForOthers} onChange={(e) => onMbldChange({ hideForOthers: e.target.checked })} />
+              Hide it from everyone else
+            </label>
+          </>
+        )}
+        <div className="text-[10px] text-neutral-400">
+          People assigned to the submission itself (e.g. staff collecting cubes) get their usual task letter. Competitors get the task above for each attempt they're assigned to compete in — or, before groups exist, if they're registered for MBLD.
+        </div>
+      </div>
+
+      {texts ? (
+        <>
+          <div className="space-y-1.5 border-t border-neutral-200 pt-3">
+            <div className="text-[11px] font-semibold text-neutral-600">Event names</div>
+            <div className="text-[10px] text-neutral-400">Replaces the event part of every row, e.g. "3x3 OH R1 - G2" → "OH R1 - G2". Leave blank to keep the default.</div>
+            {texts.events.map((ev) => renameRow("events", ev.id, ev.defaultText))}
+          </div>
+          <div className="space-y-1.5 border-t border-neutral-200 pt-3">
+            <div className="text-[11px] font-semibold text-neutral-600">Other activities</div>
+            <div className="text-[10px] text-neutral-400">Breaks and other non-event rows, as named in the WCIF.</div>
+            {texts.activities.map((a) => renameRow("activities", a.name, a.defaultText))}
+          </div>
+        </>
+      ) : (
+        <div className="text-xs text-neutral-400 border-t border-neutral-200 pt-3">Load a WCIF to rename its events and activities.</div>
+      )}
+    </div>
+  );
+}
+
+// <input type="color"> only accepts #rrggbb, but WCIF allows #rgb too.
+const toSixDigitHex = (hex) => (/^#[0-9a-f]{3}$/i.test(hex || "") ? `#${[...hex.slice(1)].map((c) => c + c).join("")}` : hex);
+
+function StageColorsPanel({ stages, stageColors, onChange }) {
+  return (
+    <div className="p-4 space-y-3 border-t border-neutral-200 overflow-y-auto">
+      <div className="text-xs font-semibold text-neutral-500 flex items-center gap-1.5">
+        <SwatchBook size={12} /> STAGE COLORS
+      </div>
+      <div className="text-[11px] text-neutral-400">
+        Colors come from the WCA website by default. Pick a different one for any stage (e.g. a pastel tone that prints better) — it's used in the schedule rows and the task key of every badge, and saved with the template.
+      </div>
+
+      <div className="space-y-1.5">
+        {stages.map((s) => {
+          const wcaColor = s.wcaColor || s.color;
+          const overridden = !!stageColors[s.name];
+          return (
+            <div key={s.name} className="flex items-center gap-2">
+              <input type="color" value={toSixDigitHex(s.color)} onChange={(e) => onChange(s.name, e.target.value)} className="w-8 h-7 border border-neutral-300 rounded cursor-pointer shrink-0" />
+              <span className="flex-1 text-sm truncate">{s.name}</span>
+              {overridden && (
+                <button onClick={() => onChange(s.name, null)} className="flex items-center gap-1 text-[11px] text-neutral-500 hover:text-neutral-800 shrink-0" title={`Back to the WCA color (${wcaColor})`}>
+                  <span className="w-3 h-3 rounded-sm border border-neutral-300" style={{ background: wcaColor }} />
+                  Reset
+                </button>
+              )}
+            </div>
+          );
+        })}
+        {stages.length === 0 && <div className="text-xs text-neutral-400">Load a WCIF first — its stages (or rooms) are listed here.</div>}
       </div>
     </div>
   );
@@ -2200,15 +2664,37 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
               </label>
               {field.useValueMap && (
                 <div>
-                  <div className="text-[11px] text-neutral-500 mb-1">Raw value → displayed text (unmapped values show as-is). Enter for a line break in the display text.</div>
+                  <label className="flex items-center gap-1.5 text-xs text-neutral-600 mb-1.5">
+                    <input type="checkbox" checked={!!field.genderVariants} onChange={(e) => onChange({ genderVariants: e.target.checked })} />
+                    Different text by gender
+                  </label>
+                  <div className="text-[11px] text-neutral-500 mb-1">
+                    Raw value → displayed text (unmapped values show as-is). Enter for a line break in the display text.
+                    {field.genderVariants && " F / M: text for women / men (WCIF gender); left empty, or for gender \"o\", the main text is used."}
+                  </div>
                   <div className="space-y-1.5">
                     {(field.valueMap || []).map((m, i) => (
-                      <div key={i} className="flex items-start gap-1.5">
-                        <input value={m.value} onChange={(e) => updateValueMap(i, { value: e.target.value })} placeholder="raw value" className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0" />
-                        <textarea value={m.label} onChange={(e) => updateValueMap(i, { label: e.target.value })} placeholder="display text" rows={1} className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0 resize-y" />
-                        <button onClick={() => removeValueMap(i)} className="text-neutral-400 hover:text-red-500 mt-1">
-                          <Trash2 size={12} />
-                        </button>
+                      <div key={i} className={field.genderVariants ? "space-y-1 pb-1.5 border-b border-neutral-100" : ""}>
+                        <div className="flex items-start gap-1.5">
+                          <input value={m.value} onChange={(e) => updateValueMap(i, { value: e.target.value })} placeholder="raw value" className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0" />
+                          <textarea value={m.label} onChange={(e) => updateValueMap(i, { label: e.target.value })} placeholder="display text" rows={1} className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0 resize-y" />
+                          <button onClick={() => removeValueMap(i)} className="text-neutral-400 hover:text-red-500 mt-1">
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                        {field.genderVariants && (
+                          <div className="flex items-center gap-1.5 pr-5">
+                            {[
+                              ["label_f", "F"],
+                              ["label_m", "M"],
+                            ].map(([key, tag]) => (
+                              <label key={key} className="flex-1 flex items-center gap-1 min-w-0">
+                                <span className="text-[10px] font-semibold text-neutral-400 w-3">{tag}</span>
+                                <input value={m[key] || ""} onChange={(e) => updateValueMap(i, { [key]: e.target.value })} placeholder={m.label} className="flex-1 text-xs px-2 py-1 border border-neutral-300 rounded-md min-w-0" />
+                              </label>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -2220,54 +2706,115 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
             </>
           )}
 
+          <div className="grid grid-cols-2 gap-1 p-0.5 bg-neutral-100 rounded-md text-xs">
+            {[["point", "Point text"], ["frame", "Text frame"]].map(([kind, label]) => (
+              <button
+                key={kind}
+                onClick={() => {
+                  if ((field.textKind || "point") === kind) return;
+                  // Unwrapped point text's X is its anchor (left edge /
+                  // center / right edge, per alignment); a frame's X is its
+                  // left edge, so shift to keep the text where it was.
+                  // Wrapped point text is already a box from X: keep X and
+                  // carry its width over.
+                  const frame = { ...DEFAULT_FRAME, ...(field.frame || {}), ...(field.wrap && kind === "frame" ? { w_mm: field.w_mm } : {}) };
+                  const anchor = field.wrap ? 0 : field.align === "center" ? frame.w_mm / 2 : field.align === "right" ? frame.w_mm : 0;
+                  const x_mm = Math.round((kind === "frame" ? field.x_mm - anchor : field.x_mm + anchor) * 10) / 10;
+                  onChange({ textKind: kind, frame, x_mm });
+                }}
+                className={`py-1 rounded ${(field.textKind || "point") === kind ? "bg-white shadow-sm font-medium text-neutral-900" : "text-neutral-500"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="text-[10px] text-neutral-400 -mt-1">
+            {field.textKind === "frame"
+              ? "The text is laid out inside a box: it shrinks, wraps and aligns within it. Drag the corner handle to resize."
+              : "Anchored at one point; it grows from there."}
+          </div>
+
           <AlignField value={field.align} onChange={(v) => onChange({ align: v })} />
-
-          <div className="border-t border-neutral-100 pt-3">
-            <label className="flex items-center gap-1.5 text-xs text-neutral-600">
-              <input type="checkbox" checked={field.wrap} onChange={(e) => onChange({ wrap: e.target.checked })} />
-              Wrap to a fixed width (multi-line)
-            </label>
-            {field.wrap && (
-              <div className="mt-2 space-y-2">
-                <NumField label="Width (mm)" value={field.w_mm} onChange={(v) => onChange({ w_mm: v })} />
-                <SelectField label="Break style" value={field.breakStyle || "break-word"} onChange={(v) => onChange({ breakStyle: v })} options={["break-word", "break-all"]} />
-                <div className="text-[10px] text-neutral-400">"break-all" splits mid-word (e.g. COMPE / TITOR); "break-word" only breaks at spaces when possible.</div>
-                <NumField label="Line height" value={field.lineHeight || 1.05} onChange={(v) => onChange({ lineHeight: v })} />
-              </div>
-            )}
-            {!field.wrap && <div className="text-[10px] text-neutral-400 mt-1.5">Without wrap, alignment treats X as the anchor point (left edge / center / right edge of the text).</div>}
-          </div>
-
-          <div>
-            <div className="text-[11px] text-neutral-500 mb-1">Font</div>
-            <select value={field.font} onChange={(e) => onChange({ font: e.target.value })} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md">
-              {fontOptions.map((f) => (
-                <option key={f} value={f}>
-                  {fontLabel(f)}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex items-center gap-3 text-xs">
-            <label className="flex items-center gap-1.5">
-              <input type="radio" checked={field.fontMode === "fixed"} onChange={() => onChange({ fontMode: "fixed" })} />
-              Fixed size
-            </label>
-            <label className="flex items-center gap-1.5">
-              <input type="radio" checked={field.fontMode === "autofit"} onChange={() => onChange({ fontMode: "autofit" })} />
-              Auto-fit
-            </label>
-          </div>
-          {field.fontMode === "fixed" ? (
-            <NumField label="Size (pt)" value={field.size} onChange={(v) => onChange({ size: v })} />
+          <SelectField label="Case" value={field.textCase || "none"} onChange={(v) => onChange({ textCase: v })} options={["none", "upper", "lower", "title"]} />
+          {field.textKind === "frame" ? (
+            <TextFrameOptions
+              field={field}
+              onChange={onChange}
+              fontSelect={
+                <div>
+                  <div className="text-[11px] text-neutral-500 mb-1">Font</div>
+                  <select value={field.font} onChange={(e) => onChange({ font: e.target.value })} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md">
+                    {fontOptions.map((f) => (
+                      <option key={f} value={f}>
+                        {fontLabel(f)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              }
+            />
           ) : (
-            <div className="grid grid-cols-2 gap-2">
-              <NumField label="Min pt" value={field.size_min || 8} onChange={(v) => onChange({ size_min: v })} />
-              <NumField label="Max pt" value={field.size_max || 16} onChange={(v) => onChange({ size_max: v })} />
-            </div>
+            <>
+              <div className="border-t border-neutral-100 pt-3">
+                <label className="flex items-center gap-1.5 text-xs text-neutral-600">
+                  <input type="checkbox" checked={field.wrap} onChange={(e) => onChange({ wrap: e.target.checked })} />
+                  Wrap to a fixed width (multi-line)
+                </label>
+                {field.wrap && (
+                  <div className="mt-2 space-y-2">
+                    <NumField label="Width (mm)" value={field.w_mm} onChange={(v) => onChange({ w_mm: v })} />
+                    <SelectField label="Break style" value={field.breakStyle || "break-word"} onChange={(v) => onChange({ breakStyle: v })} options={["break-word", "break-all"]} />
+                    <div className="text-[10px] text-neutral-400">"break-all" splits mid-word (e.g. COMPE / TITOR); "break-word" only breaks at spaces when possible.</div>
+                    <NumField label="Line height" value={field.lineHeight || 1.05} onChange={(v) => onChange({ lineHeight: v })} />
+                  </div>
+                )}
+                {!field.wrap && <div className="text-[10px] text-neutral-400 mt-1.5">Without wrap, alignment treats X as the anchor point (left edge / center / right edge of the text).</div>}
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <NumField label="Box height (mm)" value={field.boxHeightMm || 0} onChange={(v) => onChange({ boxHeightMm: Math.max(0, v) })} />
+                <SelectField label="Vertical align" value={field.vAlign || "top"} onChange={(v) => onChange({ vAlign: v })} options={["top", "middle", "bottom"]} />
+              </div>
+              <div className="text-[10px] text-neutral-400 -mt-2">
+                {field.boxHeightMm > 0
+                  ? "The text sits at the top, middle (same space above and below) or bottom of a box this tall, starting at Y — like a spreadsheet cell."
+                  : "Set a box height (0 = none) to align the text vertically inside it."}
+              </div>
+
+              <div>
+                <div className="text-[11px] text-neutral-500 mb-1">Font</div>
+                <select value={field.font} onChange={(e) => onChange({ font: e.target.value })} className="w-full text-sm px-2 py-1.5 border border-neutral-300 rounded-md">
+                  {fontOptions.map((f) => (
+                    <option key={f} value={f}>
+                      {fontLabel(f)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-3 text-xs">
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={field.fontMode === "fixed"} onChange={() => onChange({ fontMode: "fixed" })} />
+                  Fixed size
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input type="radio" checked={field.fontMode === "autofit"} onChange={() => onChange({ fontMode: "autofit" })} />
+                  Auto-fit
+                </label>
+              </div>
+              {field.fontMode === "fixed" ? (
+                <NumField label="Size (pt)" value={field.size} onChange={(v) => onChange({ size: v })} />
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  <NumField label="Min pt" value={field.size_min || 8} onChange={(v) => onChange({ size_min: v })} />
+                  <NumField label="Max pt" value={field.size_max || 16} onChange={(v) => onChange({ size_max: v })} />
+                  <NumField label="Max width (mm)" value={field.max_width_mm || 60} onChange={(v) => onChange({ max_width_mm: v })} />
+                </div>
+              )}
+            </>
           )}
           <NumField label="Letter spacing (pt)" value={field.letterSpacing || 0} onChange={(v) => onChange({ letterSpacing: v })} />
           <ColorField label="Color" value={field.color} onChange={(v) => onChange({ color: v })} />
+          <TextColorMapControls field={field} sampleData={sampleData} onChange={onChange} />
         </>
       )}
 
@@ -2331,6 +2878,7 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
               </div>
             </>
           )}
+          <ImageCropControls field={field} sampleData={sampleData} onChange={onChange} />
         </>
       )}
 
@@ -2417,6 +2965,23 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
               />
             </label>
 
+            <div>
+              <div className="text-[11px] text-neutral-500 mb-1">Column headers</div>
+              <div className="grid grid-cols-3 gap-1.5">
+                {[["time", "Time"], ["event", "Event"], ["task", "Task"]].map(([key, fallback]) => (
+                  <input
+                    key={key}
+                    type="text"
+                    placeholder={fallback}
+                    value={field.columnLabels?.[key] || ""}
+                    onChange={(e) => onChange({ columnLabels: { ...field.columnLabels, [key]: e.target.value } })}
+                    className="w-full text-xs px-2 py-1.5 border border-neutral-300 rounded-md min-w-0"
+                  />
+                ))}
+              </div>
+              <div className="text-[10px] text-neutral-400 mt-1">Event and activity names are renamed for every table under "Schedule" in the toolbar.</div>
+            </div>
+
             {/* Other / Special Activities Toggle List */}
             <div className="border-t border-neutral-200 pt-2.5">
               <div className="text-[11px] font-semibold text-neutral-600 mb-1.5">
@@ -2475,7 +3040,7 @@ function PropertiesPanel({ field, sampleData, fontOptions, fontLabel, pageWidth,
           <div className="space-y-2">
             <div className="text-[11px] font-semibold text-neutral-600">Stage names</div>
             <div className="text-[10px] text-neutral-400 mb-1">
-              Names come from the loaded competition by default — edit any of them below to override just the label (color still follows the real stage).
+              Names come from the loaded competition by default — edit any of them below to override just the label (color still follows the real stage; change it under "Stage colors" in the toolbar).
             </div>
             {stageRows.map((s, i) => (
               <div key={i} className="flex items-center gap-1.5">
@@ -2547,6 +3112,315 @@ function SelectField({ label, value, onChange, options }) {
         ))}
       </select>
     </label>
+  );
+}
+
+// Text frame settings (see textLayout.js for what each one does).
+function TextFrameOptions({ field, onChange, fontSelect }) {
+  const frame = field.frame;
+  const set = (patch) => onChange({ frame: { ...frame, ...patch } });
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-2">
+        <NumField label="Width (mm)" value={frame.w_mm} onChange={(v) => set({ w_mm: v })} />
+        {!frame.auto_height && <NumField label="Height (mm)" value={frame.h_mm} onChange={(v) => set({ h_mm: v })} />}
+      </div>
+      <label className="flex items-center gap-1.5 text-xs text-neutral-600">
+        <input type="checkbox" checked={!!frame.auto_height} onChange={(e) => set({ auto_height: e.target.checked })} />
+        Auto height (the frame grows with its text)
+      </label>
+      <div className="grid grid-cols-2 gap-2">
+        <NumField label="Inset (mm)" value={frame.padding_mm || 0} onChange={(v) => set({ padding_mm: Math.max(0, v) })} />
+        {!frame.auto_height && <SelectField label="Vertical align" value={frame.v_align} onChange={(v) => set({ v_align: v })} options={["top", "middle", "bottom"]} />}
+      </div>
+
+      {fontSelect}
+
+      <div className="flex items-center gap-3 text-xs">
+        <label className="flex items-center gap-1.5">
+          <input type="radio" checked={frame.fit === "fixed"} onChange={() => set({ fit: "fixed" })} />
+          Fixed size
+        </label>
+        <label className="flex items-center gap-1.5">
+          <input type="radio" checked={frame.fit !== "fixed"} onChange={() => set({ fit: "shrink" })} />
+          Shrink to fit
+        </label>
+      </div>
+      {frame.fit === "fixed" ? (
+        <NumField label="Size (pt)" value={field.size} onChange={(v) => onChange({ size: v })} />
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-2">
+            <NumField label="Min pt" value={frame.size_min} onChange={(v) => set({ size_min: v })} />
+            <NumField label="Max pt" value={frame.size_max} onChange={(v) => set({ size_max: v })} />
+          </div>
+          <NumField label="Break into lines below (pt)" value={frame.wrap_below || 0} onChange={(v) => set({ wrap_below: Math.max(0, v) })} />
+          <div className="text-[10px] text-neutral-400 -mt-2">
+            Keeps the text on one line while it fits at this size or bigger; below it, the text breaks into lines instead (and can grow back up). 0 = stay on one line down to the minimum.
+          </div>
+        </>
+      )}
+      <div className="grid grid-cols-2 gap-2">
+        <NumField label="Min lines" value={frame.min_lines || 1} onChange={(v) => set({ min_lines: Math.max(1, Math.round(v)) })} />
+        <NumField label="Max lines (0 = any)" value={frame.max_lines || 0} onChange={(v) => set({ max_lines: Math.max(0, Math.round(v)) })} />
+      </div>
+      {(frame.min_lines || 1) > 1 && (
+        <div className="text-[10px] text-neutral-400 -mt-2">
+          The text goes on at least this many lines when it has somewhere to break, with the words shared out evenly ("RUBÉN LÓPEZ" / "DE JUAN"). A single word stays on one line.
+        </div>
+      )}
+      <NumField label="Line height" value={field.lineHeight || 1.05} onChange={(v) => onChange({ lineHeight: v })} />
+      <SelectField label="Break style" value={field.breakStyle || "break-word"} onChange={(v) => onChange({ breakStyle: v })} options={["break-word", "break-all"]} />
+      <SelectField label="If it still doesn't fit" value={frame.overflow} onChange={(v) => set({ overflow: v })} options={["visible", "clip", "ellipsis"]} />
+      <div className="text-[10px] text-neutral-400 -mt-2">"clip" drops the lines that fall outside the frame; "ellipsis" also ends the last one with "…". A red marker on the frame means its text doesn't fit.</div>
+    </div>
+  );
+}
+
+// An image drawn the way placeImage (imageCrop.js) says — the same math
+// pdfExport.js uses, so the preview shows exactly what gets printed.
+function CroppedImage({ src, crop, fit, boxW, boxH }) {
+  const [natural, setNatural] = useState(null);
+  const ready = natural && natural.src === src;
+  const p = ready ? placeImage(natural.w, natural.h, crop, fit, boxW, boxH) : null;
+  const sx = p ? p.dw / p.sw : 0;
+  const sy = p ? p.dh / p.sh : 0;
+  return (
+    <div style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden" }}>
+      {/* The drawn area is p.dx..p.dx+p.dw; clipping to it keeps the rest of the image hidden. */}
+      <div style={{ position: "absolute", left: p ? p.dx : 0, top: p ? p.dy : 0, width: p ? p.dw : "100%", height: p ? p.dh : "100%", overflow: "hidden" }}>
+        <img
+          src={src}
+          alt=""
+          draggable={false}
+          onLoad={(e) => setNatural({ src, w: e.currentTarget.naturalWidth || 512, h: e.currentTarget.naturalHeight || 512 })}
+          style={
+            p
+              ? { position: "absolute", maxWidth: "none", left: -p.sx * sx, top: -p.sy * sy, width: natural.w * sx, height: natural.h * sy }
+              : { width: "100%", height: "100%", objectFit: "contain", opacity: 0 }
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
+// Fit mode + crop button for an image field. Mapped images share one crop
+// (it's in fractions of the image, so it applies to each of them); the
+// editor shows whichever image the sample data currently picks.
+function ImageCropControls({ field, sampleData, onChange }) {
+  const [editing, setEditing] = useState(false);
+  const src = field.mapped ? resolveMapping(field, sampleData, "image")?.preview || field.fallbackPreview : field.preview;
+  return (
+    <div className="border-t border-neutral-100 pt-3 space-y-2">
+      <div className="text-[11px] text-neutral-500">Fit in box</div>
+      <div className="grid grid-cols-3 gap-1 p-0.5 bg-neutral-100 rounded-md text-xs">
+        {[["contain", "Fit"], ["cover", "Fill"], ["stretch", "Stretch"]].map(([fit, label]) => (
+          <button key={fit} onClick={() => onChange({ fit })} className={`py-1 rounded ${(field.fit || "contain") === fit ? "bg-white shadow-sm font-medium text-neutral-900" : "text-neutral-500"}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+      <div className="text-[10px] text-neutral-400">Fit shows the whole (cropped) image; Fill covers the box and trims what doesn't match its shape; Stretch distorts it to the box.</div>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={() => setEditing(true)}
+          disabled={!src}
+          className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 border border-neutral-300 rounded-md hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <Crop size={12} /> Crop…
+        </button>
+        {!isFullCrop(field.crop) && (
+          <button onClick={() => onChange({ crop: { ...FULL_CROP } })} className="text-xs text-blue-600 hover:underline">
+            Reset crop
+          </button>
+        )}
+        {!src && <span className="text-[10px] text-neutral-400">Add a preview image first</span>}
+      </div>
+      {editing && src && <CropEditor src={src} crop={field.crop} frameAspect={field.w_mm / field.h_mm} onChange={(crop) => onChange({ crop })} onClose={() => setEditing(false)} />}
+    </div>
+  );
+}
+
+// Modal crop editor: drag the rectangle to move it, its corners to resize
+// it. Changes apply live; "Match box shape" keeps the rectangle in the
+// field's proportions, so Fit and Fill both show exactly the selected area.
+function CropEditor({ src, crop, frameAspect, onChange, onClose }) {
+  const [natural, setNatural] = useState(null);
+  const [lockAspect, setLockAspect] = useState(false);
+  const dragRef = useRef(null);
+  const c = normalizeCrop(crop);
+
+  const MAX_W = 560;
+  const MAX_H = 420;
+  const scale = natural ? Math.min(MAX_W / natural.w, MAX_H / natural.h) : 1;
+  const dispW = natural ? natural.w * scale : MAX_W;
+  const dispH = natural ? natural.h * scale : MAX_H;
+  // Height (as a fraction of the image) that gives a crop of width-fraction
+  // w the box's proportions.
+  const lockedH = (w) => (w * dispW) / (dispH * frameAspect);
+
+  const startDrag = (e, mode) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragRef.current = { mode, startX: e.clientX, startY: e.clientY, orig: c };
+    const move = (ev) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const dx = (ev.clientX - d.startX) / dispW;
+      const dy = (ev.clientY - d.startY) / dispH;
+      const o = d.orig;
+      if (d.mode === "move") {
+        onChange(normalizeCrop({ ...o, x: Math.min(Math.max(o.x + dx, 0), 1 - o.w), y: Math.min(Math.max(o.y + dy, 0), 1 - o.h) }));
+        return;
+      }
+      // Corner resize: the opposite corner stays put.
+      const left = d.mode.includes("w");
+      const top = d.mode.includes("n");
+      const right = o.x + o.w;
+      const bottom = o.y + o.h;
+      let x1 = left ? Math.min(Math.max(o.x + dx, 0), right - 0.02) : o.x;
+      let x2 = left ? right : Math.min(Math.max(right + dx, o.x + 0.02), 1);
+      let y1 = top ? Math.min(Math.max(o.y + dy, 0), bottom - 0.02) : o.y;
+      let y2 = top ? bottom : Math.min(Math.max(bottom + dy, o.y + 0.02), 1);
+      if (lockAspect) {
+        let w = x2 - x1;
+        let h = lockedH(w);
+        const maxH = top ? bottom : 1 - o.y;
+        if (h > maxH) {
+          h = maxH;
+          w = (h * dispH * frameAspect) / dispW;
+          if (left) x1 = x2 - w;
+          else x2 = x1 + w;
+        }
+        if (top) y1 = bottom - h;
+        else y2 = y1 + h;
+      }
+      onChange(normalizeCrop({ x: x1, y: y1, w: x2 - x1, h: y2 - y1 }));
+    };
+    const up = () => {
+      dragRef.current = null;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  const toggleLock = (on) => {
+    setLockAspect(on);
+    if (!on) return;
+    // Snap the current rectangle to the box's proportions, keeping its center.
+    let w = c.w;
+    let h = lockedH(w);
+    if (h > 1) {
+      h = 1;
+      w = (h * dispH * frameAspect) / dispW;
+    }
+    const cx = c.x + c.w / 2;
+    const cy = c.y + c.h / 2;
+    onChange(normalizeCrop({ x: Math.min(Math.max(cx - w / 2, 0), 1 - w), y: Math.min(Math.max(cy - h / 2, 0), 1 - h), w, h }));
+  };
+
+  const handle = (mode, style) => (
+    <div onPointerDown={(e) => startDrag(e, mode)} style={{ position: "absolute", width: 14, height: 14, background: "#fff", border: "2px solid #2563eb", borderRadius: 3, ...style }} />
+  );
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onPointerDown={onClose}>
+      <div className="bg-white rounded-lg shadow-xl p-4 space-y-3 max-w-full" onPointerDown={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-semibold flex items-center gap-1.5">
+            <Crop size={14} /> Crop image
+          </div>
+          <button onClick={onClose} className="text-neutral-400 hover:text-neutral-700">
+            <X size={16} />
+          </button>
+        </div>
+        <div style={{ position: "relative", width: dispW, height: dispH, overflow: "hidden", userSelect: "none", background: "repeating-conic-gradient(#e5e5e5 0% 25%, #fff 0% 50%) 50% / 16px 16px" }}>
+          <img
+            src={src}
+            alt=""
+            draggable={false}
+            onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth || 512, h: e.currentTarget.naturalHeight || 512 })}
+            style={{ width: dispW, height: dispH, display: "block" }}
+          />
+          {natural && (
+            <div
+              data-crop-rect
+              onPointerDown={(e) => startDrag(e, "move")}
+              style={{
+                position: "absolute",
+                left: c.x * dispW,
+                top: c.y * dispH,
+                width: c.w * dispW,
+                height: c.h * dispH,
+                boxShadow: "0 0 0 9999px rgba(0,0,0,0.55)",
+                outline: "1.5px solid #fff",
+                cursor: "move",
+              }}
+            >
+              {handle("nw", { left: -7, top: -7, cursor: "nwse-resize" })}
+              {handle("ne", { right: -7, top: -7, cursor: "nesw-resize" })}
+              {handle("sw", { left: -7, bottom: -7, cursor: "nesw-resize" })}
+              {handle("se", { right: -7, bottom: -7, cursor: "nwse-resize" })}
+            </div>
+          )}
+        </div>
+        <div className="flex items-center justify-between gap-4">
+          <label className="flex items-center gap-1.5 text-xs text-neutral-600">
+            <input type="checkbox" checked={lockAspect} onChange={(e) => toggleLock(e.target.checked)} />
+            Match box shape
+          </label>
+          <div className="flex items-center gap-2">
+            <button onClick={() => onChange({ ...FULL_CROP })} className="text-xs px-3 py-1.5 border border-neutral-300 rounded-md hover:bg-neutral-50">
+              Reset
+            </button>
+            <button onClick={onClose} className="text-xs px-3 py-1.5 bg-neutral-900 text-white rounded-md hover:bg-neutral-800">
+              Done
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// "Color depends on a value" for text fields: a color per value of one
+// sample-data key (role by default); anything unmatched keeps the text's
+// own color above.
+function TextColorMapControls({ field, sampleData, onChange }) {
+  const map = field.colorMap || { enabled: false, source: "role", mappings: [] };
+  const set = (patch) => onChange({ colorMap: { ...map, ...patch } });
+  const sampleKeys = Object.keys(sampleData).filter((k) => typeof sampleData[k] !== "object");
+  return (
+    <div className="space-y-2">
+      <label className="flex items-center gap-1.5 text-xs text-neutral-600">
+        <input
+          type="checkbox"
+          checked={map.enabled}
+          onChange={(e) =>
+            set({ enabled: e.target.checked, ...(e.target.checked && map.mappings.length === 0 ? { mappings: [{ value: "organizer", color: "#f97316" }, { value: "delegate", color: "#dc2626" }] } : {}) })
+          }
+        />
+        Color depends on a value
+      </label>
+      {map.enabled && (
+        <>
+          <MappingEditor
+            mapSource={map.source}
+            mappings={map.mappings}
+            kind="color"
+            sampleKeys={sampleKeys}
+            onSourceChange={(v) => set({ source: v })}
+            onAdd={() => set({ mappings: [...map.mappings, { value: "", color: field.color }] })}
+            onUpdate={(i, patch) => set({ mappings: map.mappings.map((m, idx) => (idx === i ? { ...m, ...patch } : m)) })}
+            onRemove={(i) => set({ mappings: map.mappings.filter((_, idx) => idx !== i) })}
+          />
+          <div className="text-[10px] text-neutral-400">Values that match none of these keep the color above.</div>
+        </>
+      )}
+    </div>
   );
 }
 
