@@ -759,6 +759,18 @@ const ZOOM_STEPS_PCT = [10, 25, 33, 50, 67, 75, 100, 125, 150, 200, 300, 400, 60
 const pctToZoom = (pct) => ((pct / 100) * REAL_PX_PER_MM) / SCALE;
 const zoomToPct = (zoom) => (zoom * SCALE * 100) / REAL_PX_PER_MM;
 const VIEWPORT_PAD = 48; // px of grey around the page
+const PAGE_GAP = 56; // px between front and back when both are shown
+const PAGE_LABEL_H = 28; // px for the "front" / "back" label above each page
+
+// Zoom at which pages ([width, height] in mm, side by side) fill the viewport.
+function fitPagesZoom(vp, dims) {
+  if (!vp || dims.length === 0) return 1;
+  const totalW = dims.reduce((sum, [w]) => sum + w * SCALE, 0);
+  const maxH = Math.max(...dims.map(([, h]) => h * SCALE));
+  const labelH = dims.length > 1 ? PAGE_LABEL_H : 0;
+  const gaps = PAGE_GAP * (dims.length - 1);
+  return Math.max(0.05, Math.min((vp.clientWidth - 2 * VIEWPORT_PAD - gaps) / totalW, (vp.clientHeight - 2 * VIEWPORT_PAD - labelH) / maxH));
+}
 
 // Left rail tabs, Canva style: each opens its panel next to the rail.
 const LEFT_TABS = [
@@ -798,6 +810,9 @@ export default function BadgeDesigner() {
   const [generating, setGenerating] = useState(null); // null | { done, total }
   const [guides, setGuides] = useState({ x: null, y: null });
   const [zoom, setZoom] = useState(1);
+  // Front and back side by side; `side` is then the active page (the one
+  // whose elements are selected and whose settings the panels show).
+  const [viewBoth, setViewBoth] = useState(false);
   const [marquee, setMarquee] = useState(null); // selection box, client px { left, top, right, bottom }
   const [spaceDown, setSpaceDown] = useState(false);
   const [panning, setPanning] = useState(false);
@@ -807,7 +822,9 @@ export default function BadgeDesigner() {
   // Ids of fields reaching past the safe margin, measured from what's
   // actually drawn (so auto-width text, alignment and rotation all count).
   const [outsideIds, setOutsideIds] = useState([]);
-  const canvasRef = useRef(null);
+  // Each shown page's element, by side, for measuring what's on it.
+  const pageRefs = useRef({});
+  const pageEl = (pageSide) => pageRefs.current[pageSide] || null;
   const viewportRef = useRef(null);
   const importInputRef = useRef(null);
   const zoomAnchorRef = useRef(null); // keeps the point under the pointer still while zooming
@@ -903,14 +920,14 @@ export default function BadgeDesigner() {
   // changed, so it doesn't trigger another render.
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const m = (sideData.safeMarginMm || 0) * SCALE * zoom;
-      const page = canvas.getBoundingClientRect();
-      const safe = { left: page.left + m, top: page.top + m, right: page.right - m, bottom: page.bottom - m };
       const TOL = 0.5; // px, so a field snapped exactly onto the line doesn't count
       const next = [];
-      if (m > 0) {
+      for (const [pageSide, canvas] of Object.entries(pageRefs.current)) {
+        if (!canvas) continue;
+        const m = (state[pageSide].safeMarginMm || 0) * SCALE * zoom;
+        if (m <= 0) continue;
+        const page = canvas.getBoundingClientRect();
+        const safe = { left: page.left + m, top: page.top + m, right: page.right - m, bottom: page.bottom - m };
         for (const el of canvas.querySelectorAll("[data-field-id]")) {
           // A non-wrapping text box is auto-width and its text is shifted by
           // its alignment, so measure the text itself rather than the box.
@@ -1143,7 +1160,7 @@ export default function BadgeDesigner() {
   // measured on screen so every kind of field (auto-width text, rotated
   // fields…) is handled the same way.
   const measureFields = (ids) => {
-    const canvas = canvasRef.current;
+    const canvas = pageEl(side);
     if (!canvas) return [];
     const page = canvas.getBoundingClientRect();
     const k = SCALE * zoom;
@@ -1248,11 +1265,11 @@ export default function BadgeDesigner() {
   const sideRef = useRef(side);
   sideRef.current = side;
 
-  // Applies { id: patch } to fields of the current side; no-op patches
-  // leave the document untouched (so a click doesn't create an undo step).
-  const applyFieldsPatch = (patches, key) =>
+  // Applies { id: patch } to fields of one side (the shown one by
+  // default); no-op patches leave the document untouched (so a click
+  // doesn't create an undo step).
+  const applyFieldsPatch = (patches, key, sk = sideRef.current) =>
     setState((s) => {
-      const sk = sideRef.current;
       let changed = false;
       const nextFields = s[sk].fields.map((f) => {
         const p = patches[f.id];
@@ -1263,22 +1280,27 @@ export default function BadgeDesigner() {
       return changed ? { ...s, [sk]: { ...s[sk], fields: nextFields } } : s;
     }, key);
 
-  const startDrag = (e, field, mode) => {
+  // pageSide: the page the field is on — with both shown, pressing on the
+  // other page makes it the active one, selecting just that field.
+  const startDrag = (e, field, mode, pageSide = side) => {
     if (spaceDown || e.button !== 0) return; // let the viewport pan instead
     e.stopPropagation();
     e.preventDefault();
+    const otherPage = pageSide !== side;
+    if (otherPage) setSide(pageSide);
     const additive = e.shiftKey || e.ctrlKey || e.metaKey;
-    if (additive && mode === "move") {
+    if (additive && mode === "move" && !otherPage) {
       setSelectedIds((ids) => (ids.includes(field.id) ? ids.filter((i) => i !== field.id) : [...ids, field.id]));
       return;
     }
     // Dragging one of several selected fields moves them all; resizing is
     // always one field.
-    const ids = mode === "move" && selectedIds.includes(field.id) ? selectedIds : [field.id];
+    const ids = mode === "move" && !otherPage && selectedIds.includes(field.id) ? selectedIds : [field.id];
     if (ids.length === 1) setSelectedIds([field.id]);
     const origins = {};
-    for (const f of fields) if (ids.includes(f.id)) origins[f.id] = { x: f.x_mm, y: f.y_mm };
+    for (const f of state[pageSide].fields) if (ids.includes(f.id)) origins[f.id] = { x: f.x_mm, y: f.y_mm };
     dragRef.current = {
+      side: pageSide,
       id: field.id,
       ids,
       origins,
@@ -1301,7 +1323,7 @@ export default function BadgeDesigner() {
     const d = dragRef.current;
     if (!d) return;
     const s = stateRef.current;
-    const sd = s[sideRef.current];
+    const sd = s[d.side];
     const dx = (e.clientX - d.startX) / (SCALE * d.zoom);
     const dy = (e.clientY - d.startY) / (SCALE * d.zoom);
     const pw = sd.page.width_mm;
@@ -1363,11 +1385,11 @@ export default function BadgeDesigner() {
       const ddy = ny - d.origY;
       const patches = {};
       for (const id of d.ids) patches[id] = { x_mm: round1(d.origins[id].x + ddx), y_mm: round1(d.origins[id].y + ddy) };
-      applyFieldsPatch(patches, d.gesture);
+      applyFieldsPatch(patches, d.gesture, d.side);
     } else {
       const nw = clamp(d.origW + dx, MIN_MM, pw - d.origX);
       const dragged = sd.fields.find((f) => f.id === d.id);
-      const patch = (p) => applyFieldsPatch({ [d.id]: p }, d.gesture);
+      const patch = (p) => applyFieldsPatch({ [d.id]: p }, d.gesture, d.side);
       if (dragged?.type === "text" && dragged.textKind === "frame") {
         const nh = clamp(d.origH + dy, MIN_MM, ph - d.origY);
         patch({ frame: { ...dragged.frame, w_mm: round1(nw), ...(dragged.frame.auto_height ? {} : { h_mm: round1(nh) }) } });
@@ -1430,7 +1452,15 @@ export default function BadgeDesigner() {
       return;
     }
     if (e.button !== 0) return;
-    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    // With both pages shown, the box selects on the page it starts on (or,
+    // starting on the grey around them, on the active one).
+    const pressed = Object.entries(pageRefs.current).find(([, el]) => {
+      const b = el?.getBoundingClientRect();
+      return b && e.clientX >= b.left && e.clientX <= b.right && e.clientY >= b.top && e.clientY <= b.bottom;
+    });
+    const boxSide = pressed ? pressed[0] : side;
+    if (boxSide !== side) setSide(boxSide);
+    const additive = (e.shiftKey || e.ctrlKey || e.metaKey) && boxSide === side;
     const base = additive ? selectedIds : [];
     const start = { x: e.clientX, y: e.clientY };
     let moved = false;
@@ -1439,7 +1469,7 @@ export default function BadgeDesigner() {
       moved = true;
       const r = { left: Math.min(start.x, ev.clientX), top: Math.min(start.y, ev.clientY), right: Math.max(start.x, ev.clientX), bottom: Math.max(start.y, ev.clientY) };
       setMarquee(r);
-      const hit = [...(canvasRef.current?.querySelectorAll("[data-field-id]") || [])]
+      const hit = [...(pageEl(boxSide)?.querySelectorAll("[data-field-id]") || [])]
         .filter((el) => {
           const b = el.getBoundingClientRect();
           return b.right >= r.left && b.left <= r.right && b.bottom >= r.top && b.top <= r.bottom;
@@ -1459,18 +1489,15 @@ export default function BadgeDesigner() {
 
   // ---------- zoom ----------
 
-  const fitZoom = () => {
-    const vp = viewportRef.current;
-    if (!vp) return 1;
-    const w = sideData.page.width_mm * SCALE;
-    const h = sideData.page.height_mm * SCALE;
-    return Math.max(0.05, Math.min((vp.clientWidth - 2 * VIEWPORT_PAD) / w, (vp.clientHeight - 2 * VIEWPORT_PAD) / h));
-  };
+  // Pages shown, as [width, height] in mm, left to right.
+  const shownSides = viewBoth ? ["front", "back"] : [side];
+  const shownDims = shownSides.map((ps) => [state[ps].page.width_mm, state[ps].page.height_mm]);
+  const fitZoom = () => fitPagesZoom(viewportRef.current, shownDims);
   // anchor: a client point that should stay still on screen (pointer zoom).
   const zoomTo = (next, anchor) => {
     const z = clamp(next, pctToZoom(5), pctToZoom(1000));
-    if (anchor && canvasRef.current) {
-      const page = canvasRef.current.getBoundingClientRect();
+    if (anchor && pageEl(side)) {
+      const page = pageEl(side).getBoundingClientRect();
       zoomAnchorRef.current = { clientX: anchor.x, clientY: anchor.y, pageX: (anchor.x - page.left) / zoom, pageY: (anchor.y - page.top) / zoom };
     }
     setZoom(z);
@@ -1484,25 +1511,23 @@ export default function BadgeDesigner() {
   // After a pointer-anchored zoom, scroll so that point is back under the pointer.
   useLayoutEffect(() => {
     const a = zoomAnchorRef.current;
-    if (!a || !canvasRef.current || !viewportRef.current) return;
+    if (!a || !pageEl(side) || !viewportRef.current) return;
     zoomAnchorRef.current = null;
-    const page = canvasRef.current.getBoundingClientRect();
+    const page = pageEl(side).getBoundingClientRect();
     viewportRef.current.scrollLeft += page.left + a.pageX * zoom - a.clientX;
     viewportRef.current.scrollTop += page.top + a.pageY * zoom - a.clientY;
-  }, [zoom]);
+  }, [zoom]); // eslint-disable-line react-hooks/exhaustive-deps -- only on zoom changes, for the side the anchor was taken on
 
-  // Fit the page to the window when the editor opens, and whenever the
-  // page shown changes size (other side, new page size).
-  const pageW = sideData.page.width_mm;
-  const pageH = sideData.page.height_mm;
+  // Fit the pages to the window when the editor opens, and whenever what's
+  // shown changes size (other side, both sides, new page size) — but not
+  // when only the active page changes while both are shown.
+  const fitKey = JSON.stringify(shownDims);
   useEffect(() => {
-    const frame = requestAnimationFrame(() => {
-      const vp = viewportRef.current;
-      if (!vp) return;
-      setZoom(Math.max(0.05, Math.min((vp.clientWidth - 2 * VIEWPORT_PAD) / (pageW * SCALE), (vp.clientHeight - 2 * VIEWPORT_PAD) / (pageH * SCALE))));
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [side, pageW, pageH]);
+    // A timer rather than an animation frame: frames don't run while the
+    // window is hidden, which would leave the pages unfitted until shown.
+    const timer = setTimeout(() => setZoom(fitPagesZoom(viewportRef.current, JSON.parse(fitKey))));
+    return () => clearTimeout(timer);
+  }, [fitKey]);
 
   // Ctrl/⌘ + wheel zooms at the pointer (instead of zooming the browser).
   useEffect(() => {
@@ -1822,12 +1847,64 @@ export default function BadgeDesigner() {
     reader.readAsText(file, "utf-8");
   };
 
-  const pw = sideData.page.width_mm * SCALE;
-  const ph = sideData.page.height_mm * SCALE;
-  const tintColor = sideData.tint.enabled ? resolveMapping({ mapSource: sideData.tint.mapSource, mappings: sideData.tint.mappings, fallbackColor: sideData.tint.fallbackColor }, state.sampleData, "color") : null;
-  const bgMapEnabled = sideData.backgroundMap?.enabled;
-  const bgMapMatch = bgMapEnabled ? resolveMapping(sideData.backgroundMap, state.sampleData, "image") : null;
-  const bgMapSrc = bgMapEnabled ? (bgMapMatch ? bgMapMatch.preview : sideData.backgroundMap.fallbackPreview) : null;
+  // One page (side) of the badge on the canvas, at the current zoom.
+  const renderPage = (pageSide) => {
+    const pd = state[pageSide];
+    const active = pageSide === side;
+    const pw = pd.page.width_mm * SCALE;
+    const ph = pd.page.height_mm * SCALE;
+    const tintColor = pd.tint.enabled ? resolveMapping({ mapSource: pd.tint.mapSource, mappings: pd.tint.mappings, fallbackColor: pd.tint.fallbackColor }, state.sampleData, "color") : null;
+    const bgMapEnabled = pd.backgroundMap?.enabled;
+    const bgMapMatch = bgMapEnabled ? resolveMapping(pd.backgroundMap, state.sampleData, "image") : null;
+    const bgMapSrc = bgMapEnabled ? (bgMapMatch ? bgMapMatch.preview : pd.backgroundMap.fallbackPreview) : null;
+    return (
+      <div key={pageSide} className="flex flex-col items-start shrink-0">
+        {viewBoth && (
+          <div className={`h-7 text-xs font-medium capitalize ${active ? "text-blue-700" : "text-neutral-400"}`}>{pageSide}</div>
+        )}
+        <div style={{ width: pw * zoom, height: ph * zoom }} className={viewBoth && active ? "ring-2 ring-blue-400 ring-offset-2 ring-offset-neutral-100" : ""}>
+          <div
+            ref={(el) => {
+              pageRefs.current[pageSide] = el;
+            }}
+            data-page-side={pageSide}
+            style={{ width: pw, height: ph, backgroundColor: "#ffffff", position: "relative", transform: `scale(${zoom})`, transformOrigin: "top left", pointerEvents: spaceDown ? "none" : undefined }}
+            className="shadow-lg ring-1 ring-neutral-300 overflow-hidden"
+          >
+            {bgMapEnabled ? (
+              bgMapSrc && <img src={bgMapSrc} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }} />
+            ) : (
+              pd.background && (
+                <>
+                  <img src={pd.background} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", filter: pd.tint.enabled ? "grayscale(1)" : "none" }} />
+                  {pd.tint.enabled && <div style={{ position: "absolute", inset: 0, background: tintColor, mixBlendMode: "multiply" }} />}
+                </>
+              )
+            )}
+            {pd.fields.map((f) => (
+              <FieldBox
+                key={f.id}
+                field={f}
+                scale={SCALE}
+                selected={active && selectedIds.includes(f.id)}
+                showHandles={active && selectedIds.length === 1 && selectedIds[0] === f.id}
+                outsideMargin={outsideIds.includes(f.id)}
+                sampleData={state.sampleData}
+                onPointerDownMove={(e) => startDrag(e, f, "move", pageSide)}
+                onPointerDownResize={(e) => startDrag(e, f, "resize", pageSide)}
+              />
+            ))}
+            {pd.safeMarginMm > 0 && <div style={{ position: "absolute", inset: pd.safeMarginMm * SCALE, border: "1px dashed rgba(236, 72, 153, 0.8)", pointerEvents: "none" }} />}
+            {active && guides.x !== null && <div style={{ position: "absolute", left: guides.x * SCALE, top: 0, bottom: 0, width: 1 / zoom, background: "#2563eb", pointerEvents: "none" }} />}
+            {active && guides.y !== null && <div style={{ position: "absolute", top: guides.y * SCALE, left: 0, right: 0, height: 1 / zoom, background: "#2563eb", pointerEvents: "none" }} />}
+          </div>
+        </div>
+      </div>
+    );
+  };
+  // Size of everything on the canvas, for the scrollable area around it.
+  const contentW = shownDims.reduce((sum, [w]) => sum + w * SCALE * zoom, 0) + PAGE_GAP * (shownDims.length - 1);
+  const contentH = Math.max(...shownDims.map(([, h]) => h * SCALE * zoom)) + (viewBoth ? PAGE_LABEL_H : 0);
   const personCount = state.wcif ? badgeablePersons(state.wcif).length : 0;
 
   const iconButton = "p-1.5 rounded-md text-neutral-600 hover:bg-neutral-100 disabled:opacity-30 disabled:hover:bg-transparent";
@@ -1853,13 +1930,21 @@ export default function BadgeDesigner() {
               key={s}
               onClick={() => {
                 setSide(s);
+                setViewBoth(false);
                 setSelectedIds([]);
               }}
-              className={`px-3 py-1 font-medium capitalize ${side === s ? "bg-neutral-900 text-white" : "bg-white text-neutral-600 hover:bg-neutral-50"}`}
+              className={`px-3 py-1 font-medium capitalize ${!viewBoth && side === s ? "bg-neutral-900 text-white" : "bg-white text-neutral-600 hover:bg-neutral-50"}`}
             >
               {s}
             </button>
           ))}
+          <button
+            onClick={() => setViewBoth(true)}
+            className={`px-3 py-1 font-medium border-l border-neutral-300 ${viewBoth ? "bg-neutral-900 text-white" : "bg-white text-neutral-600 hover:bg-neutral-50"}`}
+            title="Show front and back side by side"
+          >
+            Both
+          </button>
         </div>
 
         {/* page of the side shown: size and safe margin */}
@@ -2159,43 +2244,8 @@ export default function BadgeDesigner() {
             className="absolute inset-0 overflow-auto"
             style={{ cursor: panning ? "grabbing" : spaceDown ? "grab" : "default" }}
           >
-            <div style={{ minWidth: "100%", minHeight: "100%", width: pw * zoom + 2 * VIEWPORT_PAD, height: ph * zoom + 2 * VIEWPORT_PAD, display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <div style={{ width: pw * zoom, height: ph * zoom, flexShrink: 0 }}>
-                <div
-                  ref={canvasRef}
-                  style={{ width: pw, height: ph, backgroundColor: "#ffffff", position: "relative", transform: `scale(${zoom})`, transformOrigin: "top left", pointerEvents: spaceDown ? "none" : undefined }}
-                  className="shadow-lg ring-1 ring-neutral-300 overflow-hidden"
-                >
-                  {bgMapEnabled ? (
-                    bgMapSrc && <img src={bgMapSrc} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }} />
-                  ) : (
-                    sideData.background && (
-                      <>
-                        <img src={sideData.background} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", filter: sideData.tint.enabled ? "grayscale(1)" : "none" }} />
-                        {sideData.tint.enabled && <div style={{ position: "absolute", inset: 0, background: tintColor, mixBlendMode: "multiply" }} />}
-                      </>
-                    )
-                  )}
-                  {fields.map((f) => (
-                    <FieldBox
-                      key={f.id}
-                      field={f}
-                      scale={SCALE}
-                      selected={selectedIds.includes(f.id)}
-                      showHandles={selectedIds.length === 1 && selectedIds[0] === f.id}
-                      outsideMargin={outsideIds.includes(f.id)}
-                      sampleData={state.sampleData}
-                      onPointerDownMove={(e) => startDrag(e, f, "move")}
-                      onPointerDownResize={(e) => startDrag(e, f, "resize")}
-                    />
-                  ))}
-                  {sideData.safeMarginMm > 0 && (
-                    <div style={{ position: "absolute", inset: sideData.safeMarginMm * SCALE, border: "1px dashed rgba(236, 72, 153, 0.8)", pointerEvents: "none" }} />
-                  )}
-                  {guides.x !== null && <div style={{ position: "absolute", left: guides.x * SCALE, top: 0, bottom: 0, width: 1 / zoom, background: "#2563eb", pointerEvents: "none" }} />}
-                  {guides.y !== null && <div style={{ position: "absolute", top: guides.y * SCALE, left: 0, right: 0, height: 1 / zoom, background: "#2563eb", pointerEvents: "none" }} />}
-                </div>
-              </div>
+            <div style={{ minWidth: "100%", minHeight: "100%", width: contentW + 2 * VIEWPORT_PAD, height: contentH + 2 * VIEWPORT_PAD, display: "flex", alignItems: "center", justifyContent: "center", gap: PAGE_GAP }}>
+              {shownSides.map(renderPage)}
             </div>
           </div>
 
