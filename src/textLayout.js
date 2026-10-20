@@ -8,8 +8,9 @@
 // A text frame works like frame text in Affinity: a fixed-width box whose
 // text wraps inside it, with:
 // - fit "fixed": one size; "shrink": the largest size between size_min and
-//   size_max that fits the frame without splitting any word in two — only
-//   if nothing fits even at size_min are words split, per the break style. With wrap_below set, shrinking first tries
+//   size_max that fits the frame without splitting any word in two. Only
+//   if nothing fits even at size_min do lines also break after hyphens,
+//   and only if that doesn't fit either are words split, per break style. With wrap_below set, shrinking first tries
 //   to keep the text on a single line down to that size, and only then
 //   breaks it into more lines (which may let it grow back up to size_max).
 // - max_lines: 0 = as many as fit.
@@ -52,14 +53,15 @@ export function applyTextCase(text, textCase) {
 }
 
 // Splits `text` into lines no wider than maxWidth. Hard "\n" breaks are
-// kept. "break-word" breaks at spaces and only splits a word that can't fit
-// on a line of its own; "break-all" may split anywhere.
+// kept. "break-word" breaks at spaces and after hyphens, and only splits a
+// word that can't fit on a line of its own; "break-all" may split anywhere.
 export function wrapText(text, size, maxWidth, measure, breakStyle = "break-word") {
-  return wrapTextInfo(text, size, maxWidth, measure, breakStyle).lines;
+  return wrapTextInfo(text, size, maxWidth, measure, breakStyle, true).lines;
 }
 
-// wrapText, plus whether some word had to be split across lines.
-function wrapTextInfo(text, size, maxWidth, measure, breakStyle) {
+// wrapText, plus whether some word had to be split across lines. With
+// hyphens false, "break-word" breaks at spaces only.
+function wrapTextInfo(text, size, maxWidth, measure, breakStyle, hyphens) {
   const lines = [];
   let splitWord = false;
   const fitsWidth = (s) => measure(s, size) <= maxWidth;
@@ -88,18 +90,32 @@ function wrapTextInfo(text, size, maxWidth, measure, breakStyle) {
       continue;
     }
     let current = "";
-    for (const word of paragraph.split(" ")) {
-      const trial = current ? `${current} ${word}` : word;
+    const pieces = hyphens ? breakPoints(paragraph) : paragraph.split(" ").map((word, i) => ({ text: word, sep: i > 0 ? " " : "" }));
+    for (const { text: piece, sep } of pieces) {
+      const trial = current ? `${current}${sep}${piece}` : piece;
       if (fitsWidth(trial)) {
         current = trial;
       } else {
         if (current) lines.push(current);
-        current = splitLongWord(word);
+        current = splitLongWord(piece);
       }
     }
     lines.push(current);
   }
   return { lines, splitWord };
+}
+
+// The pieces a line may break between: words (joined back with a space)
+// and, inside a hyphenated word, the parts after each hyphen (joined with
+// nothing), so "García-Pérez" can break as "García-" / "Pérez". Breaking
+// there doesn't count as splitting a word.
+export function breakPoints(paragraph) {
+  const pieces = [];
+  paragraph.split(" ").forEach((word, i) => {
+    const parts = word.match(/[^-‐–]*[-‐–]+|[^-‐–]+$/g) || [word];
+    parts.forEach((part, j) => pieces.push({ text: part, sep: j > 0 ? "" : i > 0 ? " " : "" }));
+  });
+  return pieces;
 }
 
 /**
@@ -116,7 +132,7 @@ export function layoutTextFrame(text, frame, { measure, lineHeight = 1.05, break
   const innerH = f.auto_height ? Infinity : Math.max(f.h_mm * MM_TO_PT - 2 * pad, 1);
   const maxLines = f.max_lines > 0 ? f.max_lines : Infinity;
 
-  const linesAt = (size, style = breakStyle) => wrapTextInfo(text, size, innerW, measure, style);
+  const linesAt = (size, style = breakStyle, hyphens = true) => wrapTextInfo(text, size, innerW, measure, style, hyphens);
   const heightOf = (n, size) => n * size * lineHeight;
   const fits = (lines, size, allowedLines) => lines.length <= allowedLines && heightOf(lines.length, size) <= innerH + 0.01;
 
@@ -127,28 +143,36 @@ export function layoutTextFrame(text, frame, { measure, lineHeight = 1.05, break
     const max = Math.max(f.size_max, f.size_min);
     const min = Math.min(f.size_max, f.size_min);
     const singleLineFloor = f.wrap_below > 0 ? Math.min(Math.max(f.wrap_below, min), max) : min;
-    // wholeWords: only accept sizes where every word stays whole (breaking
-    // at spaces only); otherwise words may be split per the break style.
-    const search = (style, wholeWords) => {
+    // wholeWords: only accept sizes where every word stays whole; otherwise
+    // words may be split per the break style. hyphens: whether lines may
+    // also break after a hyphen ("GARCÍA-" / "PÉREZ").
+    const search = (style, wholeWords, hyphens) => {
       const ok = (r, s, allowed) => fits(r.lines, s, allowed) && !(wholeWords && r.splitWord);
       // 1. One line, from the biggest size down to the wrap threshold.
       for (let s = max; s >= singleLineFloor - 1e-9 && !found; s -= SIZE_STEP) {
-        const r = linesAt(s, style);
+        const r = linesAt(s, style, hyphens);
         if (ok(r, s, 1)) [size, lines, found] = [s, r.lines, true];
       }
       // 2. Then as many lines as allowed, again from the biggest size.
       for (let s = max; s >= min - 1e-9 && !found; s -= SIZE_STEP) {
-        const r = linesAt(s, style);
+        const r = linesAt(s, style, hyphens);
         if (ok(r, s, maxLines)) [size, lines, found] = [s, r.lines, true];
       }
     };
-    search("break-word", true);
-    // Nothing fits with whole words, even at the minimum: split words.
-    if (!found) search(breakStyle, false);
+    // Least to most invasive, each only if the previous fits at no size:
+    // breaking at spaces only, then also after hyphens (a hyphenated
+    // surname too long for a line even at the minimum size), then
+    // splitting words per the break style.
+    search("break-word", true, false);
+    if (!found) search("break-word", true, true);
+    if (!found) search(breakStyle, false, true);
     if (!found) [size, lines] = [min, linesAt(min).lines];
   } else {
     size = fixedSize;
-    lines = linesAt(size).lines;
+    // Same order at a fixed size: after a hyphen only if some word would
+    // otherwise have to be split.
+    const spacesOnly = linesAt(size, breakStyle, false);
+    lines = spacesOnly.splitWord ? linesAt(size).lines : spacesOnly.lines;
     found = fits(lines, size, maxLines);
   }
 

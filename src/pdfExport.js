@@ -2,7 +2,7 @@ import { PDFDocument, rgb, StandardFonts, pushGraphicsState, popGraphicsState, c
 import fontkit from "@pdf-lib/fontkit";
 import QRCode from "qrcode";
 import { buildCompetitorSchedules, buildStageList } from "./schedule.js";
-import { applyTextCase, layoutTextFrame } from "./textLayout.js";
+import { applyTextCase, breakPoints, layoutTextFrame } from "./textLayout.js";
 import { isFullCrop, placeImage } from "./imageCrop.js";
 import { personRole as matchPersonRole } from "./roles.js";
 import { pickMappedLabel } from "./valueMap.js";
@@ -333,10 +333,11 @@ function wrapLines(fonts, preferredFont, text, size, maxWidthPt, breakStyle) {
       lines.push("");
       continue;
     }
-    const tokens = breakStyle === "break-all" ? paragraph.split("") : paragraph.split(" ");
-    const sep = breakStyle === "break-all" ? "" : " ";
+    // break-word: at spaces and after hyphens, like the browser preview
+    // (see breakPoints in textLayout.js).
+    const tokens = breakStyle === "break-all" ? paragraph.split("").map((ch) => ({ text: ch, sep: "" })) : breakPoints(paragraph);
     let current = "";
-    for (const token of tokens) {
+    for (const { text: token, sep } of tokens) {
       const trial = current ? current + sep + token : token;
       if (widthOf(trial) <= maxWidthPt || !current) {
         current = trial;
